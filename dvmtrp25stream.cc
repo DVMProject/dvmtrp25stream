@@ -27,6 +27,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using boost::asio::ip::udp;
@@ -1513,9 +1514,23 @@ private:
             if (net_state == NET_STAT_RUNNING) {
                 OutboundFrame frame;
                 std::deque<OutboundFrame> deferred_frames;
+                std::unordered_set<std::string> deferred_non_end_calls;
                 int sends = 0;
-                while (sends < 64 && pop_frame(frame)) {
+                int attempts = 0;
+                while (attempts < 64 && pop_frame(frame)) {
+                    attempts++;
+
+                    // preserve per-call ordering inside this tick: if we already deferred
+                    // non-end voice for a call, do not allow its end marker to pass it
+                    if (frame.end_of_call && deferred_non_end_calls.find(frame.call_key) != deferred_non_end_calls.end()) {
+                        deferred_frames.push_back(std::move(frame));
+                        continue;
+                    }
+
                     if (!send_protocol_frame(frame)) {
+                        if (!frame.end_of_call) {
+                            deferred_non_end_calls.insert(frame.call_key);
+                        }
                         deferred_frames.push_back(std::move(frame));
                         continue;
                     }
