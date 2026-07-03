@@ -18,9 +18,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -310,12 +313,13 @@ std::string make_call_key(const std::string& short_name, long source_tgid, uint3
 }
 
 /**
- * @brief Generates a mux lane key based only on destination TGID.
- * @param short_name Unused (preserved for caller compatibility).
- * @param dst_tgid The destination TGID.
- * @returns std::string A unique mux lane key in the format "dst_tgid".
+ * @brief Generates a mux lane key for one destination stream lane.
+ * @param route_key Route signature key.
+ * @param short_name Source short name.
+ * @param dst_tgid Destination TGID.
+ * @returns std::string A unique mux lane key.
  */
-std::string make_mux_lane_key(const std::string& route_key, const std::string &short_name, uint32_t dst_tgid) 
+std::string make_mux_lane_key(const std::string& route_key, const std::string &short_name, uint32_t dst_tgid)
 {
     std::ostringstream oss;
     oss << short_name << ":" << dst_tgid;
@@ -366,6 +370,7 @@ struct FneConfig {
     uint32_t pacedCallTimeoutMs = 10000;
     uint32_t orphanCallTimeoutMs = 12000;
     uint32_t endedCallCleanupMs = 30000;
+    uint32_t sendWorkers = 4;
 };
 
 
@@ -419,6 +424,7 @@ struct P25CallState {
 struct OutboundFrame {
     std::string call_key;
     std::string lane_key;
+    uint32_t dst_tgid = 0U;
     std::vector<uint8_t> payload;
     bool end_of_call = false;
 };
@@ -499,6 +505,7 @@ public:
         fne_config.pacedCallTimeoutMs = (uint32_t)(fne.value("pacedCallTimeoutMs", fne_config.pacedCallTimeoutMs));
         fne_config.orphanCallTimeoutMs = (uint32_t)(fne.value("orphanCallTimeoutMs", fne_config.orphanCallTimeoutMs));
         fne_config.endedCallCleanupMs = (uint32_t)(fne.value("endedCallCleanupMs", fne_config.endedCallCleanupMs));
+        fne_config.sendWorkers = (uint32_t)(fne.value("sendWorkers", fne_config.sendWorkers));
         if (fne_config.maxMissedPings == 0U) {
             fne_config.maxMissedPings = 10U;
         }
@@ -510,6 +517,12 @@ public:
         }
         if (fne_config.endedCallCleanupMs < 5000U) {
             fne_config.endedCallCleanupMs = 5000U;
+        }
+        if (fne_config.sendWorkers == 0U) {
+            fne_config.sendWorkers = 1U;
+        }
+        if (fne_config.sendWorkers > 32U) {
+            fne_config.sendWorkers = 32U;
         }
 
         max_queue_depth = static_cast<size_t>(config_data.value("maxQueueDepth", 8192));
@@ -543,7 +556,8 @@ public:
                                 << ", maxMissedPings = " << fne_config.maxMissedPings
                                 << ", pacedCallTimeoutMs = " << fne_config.pacedCallTimeoutMs
                                 << ", orphanCallTimeoutMs = " << fne_config.orphanCallTimeoutMs
-                                << ", endedCallCleanupMs = " << fne_config.endedCallCleanupMs;
+                                << ", endedCallCleanupMs = " << fne_config.endedCallCleanupMs
+                                << ", sendWorkers = " << fne_config.sendWorkers;
 
         return 0;
     }
@@ -562,6 +576,7 @@ public:
             socket.non_blocking(true);
 
             running.store(true);
+            start_sender_workers();
             net_state = NET_STAT_WAITING_CONNECT;
             next_retry_at = std::chrono::steady_clock::now();
             worker = std::thread(&DVMTRP25Stream::worker_loop, this);
@@ -583,6 +598,8 @@ public:
         if (worker.joinable()) {
             worker.join();
         }
+
+        stop_sender_workers();
 
         if (socket.is_open()) {
             send_disconnect();
@@ -609,8 +626,8 @@ public:
      */
     int call_end(Call_Data_t call_info) override {
         const Route *route = find_route(call_info.talkgroup, call_info.short_name, call_info.encrypted);
-        const uint32_t dst_tgid = resolve_dst_tgid(route, call_info.talkgroup);
-        const std::string call_key = make_call_key(call_info.short_name, call_info.talkgroup, dst_tgid);
+        uint32_t dst_tgid = resolve_dst_tgid(route, call_info.talkgroup);
+        std::string call_key = make_call_key(call_info.short_name, call_info.talkgroup, dst_tgid);
 
         P25CallState state;
         bool have_state = false;
@@ -629,24 +646,26 @@ public:
         const std::string fallback_lane_key = make_mux_lane_key(make_route_lane_key(route), call_info.short_name, dst_tgid);
         const bool have_mux_state = has_mux_call_state(call_key);
         const std::string lane_key = resolve_lane_key_for_call(call_key, fallback_lane_key);
+        bool forced_end_injection = false;
 
         // Guard against false call_end callbacks (for non-P25 or otherwise
         // unrouted calls): do not synthesize end frames unless this call had
         // real voice/mux state in this plugin.
         if (!have_state && !have_mux_state) {
             if (route != nullptr) {
-                BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: call_end route matched but no voice/mux state, skipping end injection"
+                BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: call_end route matched but no voice/mux state, forcing fallback end injection"
                                            << ", callKey = " << call_key
                                            << ", tgid = " << call_info.talkgroup
                                            << ", sysId = " << call_info.sys_num
                                            << ", shortName = " << call_info.short_name;
+                forced_end_injection = true;
             } else {
                 BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: call_end no route/state, callKey = " << call_key
                                            << ", tgid = " << call_info.talkgroup
                                            << ", sysId = " << call_info.sys_num
                                            << ", shortName = " << call_info.short_name;
+                return 0;
             }
-            return 0;
         }
 
         if (have_state && state.imbeCount > 0U) {
@@ -692,6 +711,11 @@ public:
 
         BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: queued TDU, callKey = " << call_key
                                  << ", dstTg = " << header.dstId;
+        if (forced_end_injection) {
+            BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: fallback call_end injected without prior voice state"
+                                       << ", callKey = " << call_key
+                                       << ", dstTg = " << header.dstId;
+        }
         return 0;
     }
 
@@ -737,12 +761,7 @@ public:
             route = find_route(call_tgid, short_name, encrypted);
             if (route != nullptr) {
                 actual_tgid = call_tgid;
-            }
-
-            // Do not fall back to callback TGID when call TGID is present.
-            // This prevents misrouting an unrouted call into a routed lane when
-            // callback metadata carries a stale or conflicting TGID.
-            if (route == nullptr && callback_tgid > 0 && callback_tgid != call_tgid) {
+            } else if (callback_tgid > 0 && callback_tgid != call_tgid) {
                 BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: dropping callback TGID fallback due to mismatch"
                                          << ", callTg = " << call_tgid
                                          << ", cbTg = " << callback_tgid
@@ -1383,6 +1402,7 @@ private:
         const auto now = std::chrono::steady_clock::now();
 
         frame.lane_key = lane_key;
+        frame.dst_tgid = extract_dst_tgid_from_payload(frame.payload);
 
         CallMuxState& call_state = call_mux_state[call_key];
         call_state.lane_key = lane_key;
@@ -1450,6 +1470,15 @@ private:
 
             const bool ended = call_it->second.ended;
             const auto threshold = ended ? stale_after : force_after;
+            const bool owner_has_queued = queue_has_frame_for_call_locked(lane.active_call_key);
+            const bool owner_has_sendable = queue_has_sendable_frame_for_call_locked(lane.active_call_key, now);
+            const bool owner_has_dispatched = has_pending_dispatch_for_call(lane.active_call_key);
+
+            if (!owner_has_dispatched && (!owner_has_queued || !owner_has_sendable)) {
+                stale_lanes.emplace_back(lane_key, lane.active_call_key);
+                continue;
+            }
+
             if (now - last > threshold) {
                 stale_lanes.emplace_back(lane_key, lane.active_call_key);
             }
@@ -1707,6 +1736,21 @@ private:
     }
 
     /**
+     * @brief Extracts destination TGID from a P25 payload header.
+     * @param payload Frame payload.
+     * @returns uint32_t Destination TGID, or 0 when unavailable.
+     */
+    uint32_t extract_dst_tgid_from_payload(const std::vector<uint8_t>& payload) const {
+        if (payload.size() < MSG_HDR_SIZE || std::memcmp(payload.data(), TAG_P25_DATA, 4U) != 0) {
+            return 0U;
+        }
+
+        return (((uint32_t)(payload[8U]) << 16) |
+                ((uint32_t)(payload[9U]) << 8) |
+                ((uint32_t)(payload[10U]) << 0)) & 0x00FFFFFFU;
+    }
+
+    /**
      * @brief Finds a route based on the talkgroup ID, short name, and encryption status.
      * @param tgid The talkgroup ID.
      * @param short_name The short name of the route.
@@ -1745,8 +1789,10 @@ private:
 
             auto own_it = lane_queues.find(lane_key);
             if (own_it != lane_queues.end() && !own_it->second.empty()) {
+                OutboundFrame dropped_frame = std::move(own_it->second.front());
                 own_it->second.pop_front();
                 queue_size--;
+                adjust_drop_accounting_locked(dropped_frame);
                 if (own_it->second.empty()) {
                     lane_queues.erase(own_it);
                     lane_in_rr.erase(lane_key);
@@ -1762,8 +1808,10 @@ private:
                 for (const auto& rr_lane : lane_rr) {
                     auto it = lane_queues.find(rr_lane);
                     if (it != lane_queues.end() && !it->second.empty()) {
+                        OutboundFrame dropped_frame = std::move(it->second.front());
                         it->second.pop_front();
                         queue_size--;
+                        adjust_drop_accounting_locked(dropped_frame);
                         if (it->second.empty()) {
                             lane_queues.erase(it);
                             lane_in_rr.erase(rr_lane);
@@ -1817,8 +1865,10 @@ private:
 
             auto own_it = lane_queues.find(lane_key);
             if (own_it != lane_queues.end() && !own_it->second.empty()) {
+                OutboundFrame dropped_frame = std::move(own_it->second.back());
                 own_it->second.pop_back();
                 queue_size--;
+                adjust_drop_accounting_locked(dropped_frame);
                 if (own_it->second.empty()) {
                     lane_queues.erase(own_it);
                     lane_in_rr.erase(lane_key);
@@ -1834,8 +1884,10 @@ private:
                 for (auto rr_it = lane_rr.rbegin(); rr_it != lane_rr.rend(); ++rr_it) {
                     auto it = lane_queues.find(*rr_it);
                     if (it != lane_queues.end() && !it->second.empty()) {
+                        OutboundFrame dropped_frame = std::move(it->second.back());
                         it->second.pop_back();
                         queue_size--;
+                        adjust_drop_accounting_locked(dropped_frame);
                         if (it->second.empty()) {
                             lane_in_rr.erase(*rr_it);
                             auto erase_it = std::find(lane_rr.begin(), lane_rr.end(), *rr_it);
@@ -1879,7 +1931,158 @@ private:
         return it != pending_non_end_frames.end() && it->second > 0U;
     }
 
+    /**
+     * @brief Checks whether any queued frames exist for a call.
+     * @param call_key Per-call key.
+     * @returns bool True when any unsent frames remain in the outbound queue.
+     */
+    bool queue_has_frame_for_call_locked(const std::string& call_key) const {
+        for (const auto& lane_pair : lane_queues) {
+            for (const auto& frame : lane_pair.second) {
+                if (frame.call_key == call_key) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @brief Checks whether at least one queued frame for the call is currently sendable.
+     * @param call_key Per-call key.
+     * @param now Current time point.
+     * @returns bool True when a queued frame can be popped right now.
+     */
+    bool queue_has_sendable_frame_for_call_locked(const std::string& call_key,
+        const std::chrono::steady_clock::time_point& now) const {
+        for (const auto& lane_pair : lane_queues) {
+            for (const auto& frame : lane_pair.second) {
+                if (frame.call_key != call_key) {
+                    continue;
+                }
+
+                if (!frame.end_of_call) {
+                    if (is_non_end_frame_ready(call_key, now)) {
+                        return true;
+                    }
+                    continue;
+                }
+
+                if (!has_pending_non_end_frames_for_call_locked(call_key)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @brief Increments in-flight dispatched frame count for a call.
+     * @param call_key Per-call key.
+     */
+    void increment_pending_dispatch_for_call(const std::string& call_key) {
+        if (call_key.empty()) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(dispatch_accounting_mutex);
+        pending_dispatched_frames[call_key]++;
+    }
+
+    /**
+     * @brief Decrements in-flight dispatched frame count for a call.
+     * @param call_key Per-call key.
+     */
+    void decrement_pending_dispatch_for_call(const std::string& call_key) {
+        if (call_key.empty()) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(dispatch_accounting_mutex);
+        auto it = pending_dispatched_frames.find(call_key);
+        if (it == pending_dispatched_frames.end()) {
+            return;
+        }
+
+        if (it->second > 1U) {
+            it->second--;
+        } else {
+            pending_dispatched_frames.erase(it);
+        }
+    }
+
+    /**
+     * @brief Checks whether a call has in-flight dispatched frames.
+     * @param call_key Per-call key.
+     * @returns bool True when frames are pending in sender workers.
+     */
+    bool has_pending_dispatch_for_call(const std::string& call_key) const {
+        std::lock_guard<std::mutex> lock(dispatch_accounting_mutex);
+        auto it = pending_dispatched_frames.find(call_key);
+        return it != pending_dispatched_frames.end() && it->second > 0U;
+    }
+
+    /**
+     * @brief Checks whether stream state for a call is stale enough to release dst ownership.
+     * @param call_key Per-call key.
+     * @param now Current time point.
+     * @returns bool True when there is no active/expected near-term protocol send.
+     */
+    bool is_stream_state_stale_for_call_locked(const std::string& call_key,
+        const std::chrono::steady_clock::time_point& now) const {
+        std::lock_guard<std::mutex> stream_lock(stream_state_mutex);
+        auto it = stream_state.find(call_key);
+        if (it == stream_state.end()) {
+            return true;
+        }
+
+        const auto next_send_at = it->second.next_protocol_send_at;
+        if (next_send_at.time_since_epoch().count() == 0) {
+            return false;
+        }
+
+        return now > (next_send_at + std::chrono::milliseconds(fne_config.pacedCallTimeoutMs));
+    }
+
+    /**
+     * @brief Adjusts accounting for dropped frames, updating pending counts and active call mappings.
+     * @param dropped_frame The OutboundFrame that was dropped.
+     */
+    void adjust_drop_accounting_locked(const OutboundFrame& dropped_frame) {
+        if (!dropped_frame.end_of_call) {
+            auto count_it = pending_non_end_frames.find(dropped_frame.call_key);
+            if (count_it != pending_non_end_frames.end()) {
+                if (count_it->second > 1U) {
+                    count_it->second--;
+                } else {
+                    pending_non_end_frames.erase(count_it);
+                }
+            }
+            return;
+        }
+
+        if (dropped_frame.dst_tgid != 0U) {
+            auto active_it = dst_tgid_active_calls.find(dropped_frame.dst_tgid);
+            if (active_it != dst_tgid_active_calls.end() && active_it->second == dropped_frame.call_key) {
+                const bool has_queued = queue_has_frame_for_call_locked(dropped_frame.call_key);
+                const bool has_dispatched = has_pending_dispatch_for_call(dropped_frame.call_key);
+                const bool stream_stale = is_stream_state_stale_for_call_locked(dropped_frame.call_key, std::chrono::steady_clock::now());
+                if (!has_queued && !has_dispatched && stream_stale) {
+                    dst_tgid_active_calls.erase(active_it);
+                }
+            }
+        }
+    }
+
+    /**
+     * @brief Checks if a non-end frame is ready to be sent based on the call's next protocol send time.
+     * @param call_key Per-call key.
+     * @param now The current time point.
+     * @returns bool True if the non-end frame is ready to be sent, false otherwise.
+     */
     bool is_non_end_frame_ready(const std::string& call_key, const std::chrono::steady_clock::time_point& now) const {
+        std::lock_guard<std::mutex> stream_lock(stream_state_mutex);
         auto it = stream_state.find(call_key);
         if (it == stream_state.end()) {
             return true;
@@ -1926,9 +2129,36 @@ private:
                 continue;
             }
 
+            if (candidate.dst_tgid != 0U) {
+                auto active_it = dst_tgid_active_calls.find(candidate.dst_tgid);
+                if (active_it != dst_tgid_active_calls.end() && active_it->second != candidate.call_key) {
+                    const bool owner_has_queued = queue_has_frame_for_call_locked(active_it->second);
+                    const bool owner_has_sendable = queue_has_sendable_frame_for_call_locked(active_it->second, now);
+                    const bool owner_has_dispatched = has_pending_dispatch_for_call(active_it->second);
+                    const bool owner_stream_stale = is_stream_state_stale_for_call_locked(active_it->second, now);
+                    if ((!owner_has_queued && !owner_has_dispatched) ||
+                        (owner_stream_stale && !owner_has_dispatched && !owner_has_sendable)) {
+                        BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: releasing stale dstTg flush owner"
+                                                   << ", dstTg = " << candidate.dst_tgid
+                                                   << ", ownerCallKey = " << active_it->second
+                                                   << ", ownerQueued = " << owner_has_queued
+                                                   << ", ownerSendable = " << owner_has_sendable
+                                                   << ", ownerDispatched = " << owner_has_dispatched;
+                        dst_tgid_active_calls.erase(active_it);
+                    } else {
+                        lane_rr.push_back(lane_key);
+                        continue;
+                    }
+                }
+            }
+
             out = std::move(it->second.front());
             it->second.pop_front();
             queue_size--;
+
+            if (out.dst_tgid != 0U && !out.end_of_call) {
+                dst_tgid_active_calls[out.dst_tgid] = out.call_key;
+            }
 
             if (!out.end_of_call) {
                 auto count_it = pending_non_end_frames.find(out.call_key);
@@ -1938,6 +2168,11 @@ private:
                     } else {
                         pending_non_end_frames.erase(count_it);
                     }
+                }
+            } else if (out.dst_tgid != 0U) {
+                auto active_it = dst_tgid_active_calls.find(out.dst_tgid);
+                if (active_it != dst_tgid_active_calls.end() && active_it->second == out.call_key) {
+                    dst_tgid_active_calls.erase(active_it);
                 }
             }
 
@@ -1969,6 +2204,7 @@ private:
      * @returns uint16_t The next sequence number.
      */
     uint16_t next_seq(bool end_of_call = false) {
+        std::lock_guard<std::mutex> lock(seq_mutex);
         if (end_of_call) {
             return RTP_END_OF_CALL_SEQ;
         }
@@ -1983,6 +2219,233 @@ private:
     }
 
     /**
+     * @brief Reserves the next protocol send slot for a call at dispatch time.
+     * @param frame Outbound frame that is about to be queued to a sender worker.
+     */
+    void reserve_dispatch_pacing_slot(const OutboundFrame& frame) {
+        if (frame.end_of_call) {
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> stream_lock(stream_state_mutex);
+
+        StreamState& state = stream_state[frame.call_key];
+        if (state.streamId == 0U) {
+            state.streamId = random_stream_id();
+            state.timestampInit = false;
+        }
+
+        if (state.next_protocol_send_at.time_since_epoch().count() == 0 || state.next_protocol_send_at < now) {
+            state.next_protocol_send_at = now + std::chrono::milliseconds(160);
+            return;
+        }
+
+        state.next_protocol_send_at += std::chrono::milliseconds(160);
+    }
+
+    /**
+     * @brief Picks a sender worker index using dst TGID lane affinity.
+     * @param frame Outbound frame to dispatch.
+     * @returns size_t Worker index.
+     */
+    size_t select_sender_worker_index(const OutboundFrame& frame) const {
+        const std::string lane_key = frame.lane_key.empty() ? frame.call_key : frame.lane_key;
+        return select_sender_worker_index_for_lane(lane_key);
+    }
+
+    /**
+     * @brief Selects a worker index for a specific lane, keeping lane affinity sticky.
+     * @param lane_key Destination lane key.
+     * @returns size_t Worker index.
+     */
+    size_t select_sender_worker_index_for_lane(const std::string& lane_key) const {
+        if (sender_workers.empty()) {
+            return 0U;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(sender_assignment_mutex);
+            auto it = sender_lane_assignments.find(lane_key);
+            if (it != sender_lane_assignments.end()) {
+                return it->second;
+            }
+        }
+
+        return 0U;
+    }
+
+    /**
+     * @brief Starts sender worker threads for parallel lane-oriented protocol sends.
+     */
+    void start_sender_workers() {
+        stop_sender_workers();
+
+        const size_t worker_count = (size_t)(std::max<uint32_t>(1U, fne_config.sendWorkers));
+        sender_workers.reserve(worker_count);
+        sender_worker_lane_counts.assign(worker_count, 0U);
+
+        for (size_t i = 0; i < worker_count; i++) {
+            auto state = std::make_unique<SenderWorkerState>();
+            state->thread = std::thread(&DVMTRP25Stream::sender_worker_loop, this, i);
+            sender_workers.push_back(std::move(state));
+        }
+    }
+
+    /**
+     * @brief Stops all sender worker threads and clears pending dispatch queues.
+     */
+    void stop_sender_workers() {
+        for (auto& worker_state : sender_workers) {
+            {
+                std::lock_guard<std::mutex> lock(worker_state->mutex);
+                worker_state->stop = true;
+            }
+            worker_state->cv.notify_all();
+        }
+
+        for (auto& worker_state : sender_workers) {
+            if (worker_state->thread.joinable()) {
+                worker_state->thread.join();
+            }
+        }
+
+        sender_workers.clear();
+        {
+            std::lock_guard<std::mutex> lock(sender_assignment_mutex);
+            sender_lane_assignments.clear();
+        }
+        sender_worker_lane_counts.clear();
+    }
+
+    /**
+     * @brief Clears queued sender-dispatch frames without stopping workers.
+     */
+    void clear_sender_dispatch_queues() {
+        std::vector<std::string> drained_call_keys;
+        for (auto& worker_state : sender_workers) {
+            std::lock_guard<std::mutex> lock(worker_state->mutex);
+            while (!worker_state->queue.empty()) {
+                drained_call_keys.push_back(worker_state->queue.front().call_key);
+                worker_state->queue.pop_front();
+            }
+            worker_state->queue.clear();
+        }
+
+        for (const auto& call_key : drained_call_keys) {
+            decrement_pending_dispatch_for_call(call_key);
+        }
+
+        std::lock_guard<std::mutex> accounting_lock(dispatch_accounting_mutex);
+        pending_dispatched_frames.clear();
+    }
+
+    /**
+     * @brief Assigns a sender worker to a lane if it does not already have one.
+     * @param lane_key Destination lane key.
+     * @returns size_t Worker index.
+     */
+    size_t get_or_assign_sender_worker_for_lane(const std::string& lane_key) {
+        if (sender_workers.empty()) {
+            return 0U;
+        }
+
+        std::lock_guard<std::mutex> lock(sender_assignment_mutex);
+        auto it = sender_lane_assignments.find(lane_key);
+        if (it != sender_lane_assignments.end()) {
+            return it->second;
+        }
+
+        size_t best_index = 0U;
+        size_t best_count = sender_worker_lane_counts.empty() ? 0U : sender_worker_lane_counts[0];
+        for (size_t i = 1; i < sender_worker_lane_counts.size(); i++) {
+            if (sender_worker_lane_counts[i] < best_count) {
+                best_count = sender_worker_lane_counts[i];
+                best_index = i;
+            }
+        }
+
+        sender_lane_assignments.emplace(lane_key, best_index);
+        sender_worker_lane_counts[best_index]++;
+        BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: assigned sender worker"
+                                 << ", laneKey = " << lane_key
+                                 << ", workerIndex = " << best_index;
+        return best_index;
+    }
+
+    /**
+     * @brief Enqueues a protocol frame into the sender worker assigned to its lane.
+     * @param frame Outbound frame to dispatch.
+     */
+    void dispatch_protocol_frame(OutboundFrame frame) {
+        if (sender_workers.empty()) {
+            send_protocol_frame(frame);
+            return;
+        }
+
+        const std::string frame_call_key = frame.call_key;
+        const std::string lane_key = frame.lane_key.empty() ? frame.call_key : frame.lane_key;
+        const size_t index = get_or_assign_sender_worker_for_lane(lane_key);
+        SenderWorkerState& worker_state = *sender_workers[index];
+        std::string dropped_call_key;
+        bool dropped_from_worker_queue = false;
+
+        increment_pending_dispatch_for_call(frame_call_key);
+
+        {
+            std::lock_guard<std::mutex> lock(worker_state.mutex);
+            if (worker_state.queue.size() >= sender_worker_max_queue_depth) {
+                dropped_call_key = worker_state.queue.front().call_key;
+                worker_state.queue.pop_front();
+                dropped_frames++;
+                dropped_from_worker_queue = true;
+            }
+            worker_state.queue.push_back(std::move(frame));
+        }
+
+        if (dropped_from_worker_queue) {
+            decrement_pending_dispatch_for_call(dropped_call_key);
+        }
+
+        worker_state.cv.notify_one();
+    }
+
+    /**
+     * @brief Worker loop that transmits protocol frames for one lane hash partition.
+     * @param index Worker index.
+     */
+    void sender_worker_loop(size_t index) {
+        SenderWorkerState& worker_state = *sender_workers[index];
+
+        while (running.load()) {
+            OutboundFrame frame;
+            bool have_frame = false;
+
+            {
+                std::unique_lock<std::mutex> lock(worker_state.mutex);
+                worker_state.cv.wait(lock, [&]() {
+                    return worker_state.stop || !worker_state.queue.empty() || !running.load();
+                });
+
+                if ((worker_state.stop || !running.load()) && worker_state.queue.empty()) {
+                    break;
+                }
+
+                if (!worker_state.queue.empty()) {
+                    frame = std::move(worker_state.queue.front());
+                    worker_state.queue.pop_front();
+                    have_frame = true;
+                }
+            }
+
+            if (have_frame) {
+                send_protocol_frame(frame);
+                decrement_pending_dispatch_for_call(frame.call_key);
+            }
+        }
+    }
+
+    /**
      * @brief The main worker loop that handles receiving control packets, managing session timers, and sending 
      *  outbound frames.
      */
@@ -1994,15 +2457,16 @@ private:
             reap_orphan_calls();
 
             if (net_state == NET_STAT_RUNNING) {
-                int sends = 0;
-                while (sends < 64) {
+                int dispatches = 0;
+                while (dispatches < 128) {
                     OutboundFrame frame;
                     if (!pop_ready_frame(frame, std::chrono::steady_clock::now())) {
                         break;
                     }
 
-                    send_protocol_frame(frame);
-                    sends++;
+                    reserve_dispatch_pacing_slot(frame);
+                    dispatch_protocol_frame(std::move(frame));
+                    dispatches++;
                 }
             }
 
@@ -2261,31 +2725,55 @@ private:
      * @param frame The OutboundFrame containing the payload and call information.
      */
     bool send_protocol_frame(const OutboundFrame& frame) {
-        StreamState *stream = nullptr;
-        auto it = stream_state.find(frame.call_key);
+        uint32_t stream_id = 0U;
+        uint32_t timestamp = 0U;
+        uint16_t seq = 0U;
         const auto now = std::chrono::steady_clock::now();
 
-        if (frame.end_of_call) {
-            if (it == stream_state.end()) {
-                StreamState& created = stream_state[frame.call_key];
-                created.streamId = random_stream_id();
-                created.timestampInit = false;
-                created.next_protocol_send_at = now;
-                stream = &created;
-            } else {
-                stream = &it->second;
-            }
-        } else {
-            StreamState& created = stream_state[frame.call_key];
-            if (created.streamId == 0U) {
-                created.streamId = random_stream_id();
-                created.timestampInit = false;
-                created.next_protocol_send_at = now;
-            }
-            stream = &created;
-        }
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> stream_lock(stream_state_mutex);
+            StreamState* stream = nullptr;
+            auto it = stream_state.find(frame.call_key);
 
-        const uint16_t seq = next_seq(frame.end_of_call);
+            if (frame.end_of_call) {
+                if (it == stream_state.end()) {
+                    StreamState& created = stream_state[frame.call_key];
+                    created.streamId = random_stream_id();
+                    created.timestampInit = false;
+                    created.next_protocol_send_at = now;
+                    stream = &created;
+                } else {
+                    stream = &it->second;
+                }
+            } else {
+                StreamState& created = stream_state[frame.call_key];
+                if (created.streamId == 0U) {
+                    created.streamId = random_stream_id();
+                    created.timestampInit = false;
+                    created.next_protocol_send_at = now;
+                }
+                stream = &created;
+            }
+
+            seq = next_seq(frame.end_of_call);
+
+            const auto now_sys = std::chrono::system_clock::now();
+            const uint32_t base_timestamp = (uint32_t)(std::chrono::duration_cast<std::chrono::milliseconds>(now_sys.time_since_epoch()).count() & 0xFFFFFFFFULL);
+            if (!stream->timestampInit) {
+                stream->timestampInit = true;
+                stream->timestamp = base_timestamp;
+            } else if (seq != RTP_END_OF_CALL_SEQ) {
+                stream->timestamp += (uint32_t)(8000U / 133U);
+            }
+
+            timestamp = stream->timestamp;
+            stream_id = stream->streamId;
+
+            if (frame.end_of_call) {
+                stream_state.erase(frame.call_key);
+            }
+        }
 
         if (frame.payload.size() >= MSG_HDR_SIZE &&
             std::memcmp(frame.payload.data(), TAG_P25_DATA, 4U) == 0) {
@@ -2293,7 +2781,7 @@ private:
             uint32_t dstId = GET_UINT24(frame.payload.data(), 8U);
             BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: send_protocol_frame"
                                      << ", callKey = " << frame.call_key
-                                     << ", streamId = " << stream->streamId
+                                     << ", streamId = " << stream_id
                                      << ", seq = " << seq
                                      << ", srcId = " << srcId
                                      << ", dstId = " << dstId
@@ -2301,15 +2789,7 @@ private:
                                      << ", frameLen = " << (uint32_t)(frame.payload[23U]);
         }
 
-        send_enveloped(frame.payload, NET_FUNC::PROTOCOL, NET_SUBFUNC::PROTOCOL_SUBFUNC_P25, seq, stream->streamId, stream);
-
-        if (!frame.end_of_call) {
-            stream->next_protocol_send_at = now + std::chrono::milliseconds(160);
-        }
-
-        if (frame.end_of_call) {
-            stream_state.erase(frame.call_key);
-        }
+        send_enveloped(frame.payload, NET_FUNC::PROTOCOL, NET_SUBFUNC::PROTOCOL_SUBFUNC_P25, seq, stream_id, timestamp, true);
 
         return true;
     }
@@ -2321,10 +2801,11 @@ private:
      * @param subfunc The subfunction code for the RTP packet.
      * @param seq The sequence number for the RTP packet.
      * @param stream_id The stream ID for the RTP packet.
-     * @param stream_state Optional pointer to the StreamState for managing timestamps.
+      * @param timestamp Optional RTP timestamp.
+      * @param has_timestamp True when timestamp is provided by caller.
      */
     void send_enveloped(const std::vector<uint8_t> &payload, uint8_t func, uint8_t subfunc, uint16_t seq,
-        uint32_t stream_id, StreamState *stream_state = nullptr) {
+          uint32_t stream_id, uint32_t timestamp = 0U, bool has_timestamp = false) {
         std::vector<uint8_t> packet(RTP_HEADER_LENGTH_BYTES + RTP_EXTENSION_HEADER_LENGTH_BYTES + RTP_FNE_HEADER_LENGTH_BYTES + payload.size(), 0x00U);
 
         packet[0U] = 0x90U; // RTP v2 + extension
@@ -2332,16 +2813,9 @@ private:
         packet[1U] = payload_type;
         SET_UINT16(seq, packet.data(), 2U);
 
-        const auto now = std::chrono::system_clock::now();
-        uint32_t timestamp = (uint32_t)(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() & 0xFFFFFFFFULL);
-        if (stream_state != nullptr) {
-            if (!stream_state->timestampInit) {
-                stream_state->timestampInit = true;
-                stream_state->timestamp = timestamp;
-            } else if (seq != RTP_END_OF_CALL_SEQ) {
-                stream_state->timestamp += (uint32_t)(8000U / 133U);
-            }
-            timestamp = stream_state->timestamp;
+        if (!has_timestamp) {
+            const auto now = std::chrono::system_clock::now();
+            timestamp = (uint32_t)(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() & 0xFFFFFFFFULL);
         }
 
         SET_UINT32(timestamp, packet.data(), 4U);
@@ -2362,7 +2836,13 @@ private:
         std::memcpy(packet.data() + RTP_HEADER_LENGTH_BYTES + RTP_EXTENSION_HEADER_LENGTH_BYTES + RTP_FNE_HEADER_LENGTH_BYTES, payload.data(), payload.size());
 
         boost::system::error_code ec;
-        socket.send_to(boost::asio::buffer(packet.data(), packet.size()), remote_endpoint, 0, ec);
+
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> socket_lock(socket_send_mutex);
+            socket.send_to(boost::asio::buffer(packet.data(), packet.size()), remote_endpoint, 0, ec);
+        }
+
         if (ec) {
             BOOST_LOG_TRIVIAL(error) << "dvmtrp25stream: send error: " << ec.message();
             reset_session();
@@ -2392,10 +2872,10 @@ private:
      * @brief Resets the session state, clearing stream and call states, and scheduling the next retry.
      */
     void reset_session() {
+        std::lock_guard<std::mutex> reset_lock(reset_mutex);
         net_state = NET_STAT_WAITING_CONNECT;
         login_stream_id = 0;
         std::memset(salt, 0x00, sizeof(salt));
-        stream_state.clear();
 
         // scope is intentional
         {
@@ -2412,8 +2892,17 @@ private:
             lane_rr.clear();
             lane_in_rr.clear();
             pending_non_end_frames.clear();
+            dst_tgid_active_calls.clear();
             queue_size = 0U;
         }
+
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> stream_lock(stream_state_mutex);
+            stream_state.clear();
+        }
+
+        clear_sender_dispatch_queues();
 
         // scope is intentional
         {
@@ -2428,6 +2917,14 @@ private:
     }
 
 private:
+    struct SenderWorkerState {
+        std::thread thread;
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::deque<OutboundFrame> queue;
+        bool stop = false;
+    };
+
     FneConfig fne_config;
     std::vector<Route> routes;
     size_t max_queue_depth = 8192;
@@ -2443,12 +2940,23 @@ private:
     std::deque<std::string> lane_rr;
     std::unordered_set<std::string> lane_in_rr;
     std::unordered_map<std::string, size_t> pending_non_end_frames;
+    std::unordered_map<uint32_t, std::string> dst_tgid_active_calls;
     size_t queue_size = 0;
     std::mutex queue_mutex;
 
     std::unordered_map<std::string, StreamState> stream_state;
+    mutable std::mutex stream_state_mutex;
     std::unordered_map<std::string, P25CallState> p25_call_state;
     std::mutex p25_state_mutex;
+
+    std::vector<std::unique_ptr<SenderWorkerState>> sender_workers;
+    std::vector<size_t> sender_worker_lane_counts;
+    std::unordered_map<std::string, size_t> sender_lane_assignments;
+    mutable std::mutex sender_assignment_mutex;
+    size_t sender_worker_max_queue_depth = 4096;
+    std::mutex socket_send_mutex;
+    mutable std::mutex dispatch_accounting_mutex;
+    std::unordered_map<std::string, size_t> pending_dispatched_frames;
 
     std::unordered_map<std::string, MuxLaneState> mux_lane_state;
     std::unordered_map<std::string, CallMuxState> call_mux_state;
@@ -2458,6 +2966,8 @@ private:
     NET_CONN_STATUS net_state = NET_STAT_INVALID;
     uint32_t login_stream_id = 0;
     uint16_t tx_seq = 0;
+    std::mutex seq_mutex;
+    std::mutex reset_mutex;
     uint8_t salt[4] = {0U, 0U, 0U, 0U};
 
     std::chrono::steady_clock::time_point next_retry_at{};
