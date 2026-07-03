@@ -294,16 +294,18 @@ uint16_t CRC16_CCITT(const uint8_t *data, size_t len)
 }
 
 /**
- * @brief Generates a unique call key based on the short name and call number.
- * @param short_name The short name associated with the call.
- * @param call_num The call number.
- * @returns std::string A unique call key in the format "short_name:call_num".
+ * @brief Generates a stable call key for cross-callback correlation.
+ * @param short_name System short name.
+ * @param source_tgid Source talkgroup ID from trunk-recorder.
+ * @param dst_tgid Destination talkgroup ID after route translation.
+ * @returns std::string Stable key in the format "short_name:source_tgid:dst_tgid".
  */
-std::string make_call_key(const std::string& short_name, int sys_num, long call_num, long source_tgid)
+std::string make_call_key(const std::string& short_name, long source_tgid, uint32_t dst_tgid)
 {
     std::ostringstream oss;
-    const long normalized_tgid = (source_tgid < 0) ? 0 : source_tgid;
-    oss << short_name << ":" << sys_num << ":" << call_num << ":" << normalized_tgid;
+    const long normalized_source_tgid = (source_tgid < 0) ? 0 : source_tgid;
+    const uint32_t normalized_dst_tgid = dst_tgid & 0x00FFFFFFU;
+    oss << short_name << ":" << normalized_source_tgid << ":" << normalized_dst_tgid;
     return oss.str();
 }
 
@@ -606,8 +608,9 @@ public:
      * @returns int 0 on success, non-zero on failure.
      */
     int call_end(Call_Data_t call_info) override {
-        const std::string call_key = make_call_key(call_info.short_name, call_info.sys_num, call_info.call_num, call_info.talkgroup);
         const Route *route = find_route(call_info.talkgroup, call_info.short_name, call_info.encrypted);
+        const uint32_t dst_tgid = resolve_dst_tgid(route, call_info.talkgroup);
+        const std::string call_key = make_call_key(call_info.short_name, call_info.talkgroup, dst_tgid);
 
         P25CallState state;
         bool have_state = false;
@@ -623,7 +626,6 @@ public:
             }
         }
 
-        const uint32_t dst_tgid = resolve_dst_tgid(route, call_info.talkgroup);
         const std::string fallback_lane_key = make_mux_lane_key(make_route_lane_key(route), call_info.short_name, dst_tgid);
         const bool have_mux_state = has_mux_call_state(call_key);
         const std::string lane_key = resolve_lane_key_for_call(call_key, fallback_lane_key);
@@ -788,7 +790,7 @@ public:
         }
 
         const int sys_num = static_cast<int>(system->get_sys_id() & 0xFFFFU);
-        const std::string call_key = make_call_key(short_name, sys_num, call->get_call_num(), actual_tgid);
+        const std::string call_key = make_call_key(short_name, actual_tgid, dst_tgid);
 
         supersede_calls_for_source_tgid(lane_key, actual_tgid, call_key);
 
