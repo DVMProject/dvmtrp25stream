@@ -348,6 +348,7 @@ struct FneConfig {
 
     uint32_t retryInterval = 3000;
     uint32_t maxMissedPings = 10;
+    uint32_t pacedCallTimeoutMs = 10000;
     bool debug = false;
 };
 
@@ -472,8 +473,12 @@ public:
         fne_config.identity = fne.value("identity", fne_config.identity);
         fne_config.retryInterval = (uint32_t)(fne.value("retryIntervalMs", fne_config.retryInterval));
         fne_config.maxMissedPings = (uint32_t)(fne.value("maxMissedPings", fne_config.maxMissedPings));
+        fne_config.pacedCallTimeoutMs = (uint32_t)(fne.value("pacedCallTimeoutMs", fne_config.pacedCallTimeoutMs));
         if (fne_config.maxMissedPings == 0U) {
             fne_config.maxMissedPings = 10U;
+        }
+        if (fne_config.pacedCallTimeoutMs == 0U) {
+            fne_config.pacedCallTimeoutMs = 10000U;
         }
         fne_config.debug = fne.value("debug", false);
 
@@ -505,7 +510,8 @@ public:
         BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: configured for FNE " << fne_config.address << ":" << fne_config.port
                                 << ", peerId = " << fne_config.peerId
                                  << ", routes = " << routes.size()
-                                 << ", maxMissedPings = " << fne_config.maxMissedPings;
+                                   << ", maxMissedPings = " << fne_config.maxMissedPings
+                                   << ", pacedCallTimeoutMs = " << fne_config.pacedCallTimeoutMs;
 
         return 0;
     }
@@ -1429,17 +1435,17 @@ private:
     }
 
     /**
-     * @brief Requeues an outbound frame at the front to retry later.
+     * @brief Requeues an outbound frame at the back to retry later.
      * @param frame The OutboundFrame to requeue.
      */
-    void requeue_frame_front(OutboundFrame frame) {
+    void requeue_frame_back(OutboundFrame frame) {
         std::lock_guard<std::mutex> lock(queue_mutex);
         if (queue.size() >= max_queue_depth) {
             queue.pop_back();
             dropped_frames++;
         }
 
-        queue.push_front(std::move(frame));
+        queue.push_back(std::move(frame));
     }
 
     /**
@@ -1529,17 +1535,38 @@ private:
 
                     if (!send_protocol_frame(frame)) {
                         if (!frame.end_of_call) {
+                            const auto now = std::chrono::steady_clock::now();
+                            auto it = paced_call_first_deferred_at.find(frame.call_key);
+                            if (it == paced_call_first_deferred_at.end()) {
+                                paced_call_first_deferred_at[frame.call_key] = now;
+                            } else {
+                                const uint64_t elapsed_ms = (uint64_t)(std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count());
+                                if (elapsed_ms >= (uint64_t)(fne_config.pacedCallTimeoutMs)) {
+                                    paced_timeout_drops++;
+                                    if (fne_config.debug || (paced_timeout_drops % 100U) == 0U) {
+                                        BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: dropping paced call frame after timeout"
+                                                                   << ", callKey = " << frame.call_key
+                                                                   << ", elapsedMs = " << elapsed_ms
+                                                                   << ", timeoutMs = " << fne_config.pacedCallTimeoutMs
+                                                                   << ", drops = " << paced_timeout_drops;
+                                    }
+                                    continue;
+                                }
+                            }
+
                             deferred_non_end_calls.insert(frame.call_key);
                         }
                         deferred_frames.push_back(std::move(frame));
                         continue;
                     }
+
+                    paced_call_first_deferred_at.erase(frame.call_key);
                     sends++;
                 }
 
                 while (!deferred_frames.empty()) {
-                    requeue_frame_front(std::move(deferred_frames.back()));
-                    deferred_frames.pop_back();
+                    requeue_frame_back(std::move(deferred_frames.front()));
+                    deferred_frames.pop_front();
                 }
             }
 
@@ -1952,6 +1979,7 @@ private:
         login_stream_id = 0;
         std::memset(salt, 0x00, sizeof(salt));
         stream_state.clear();
+        paced_call_first_deferred_at.clear();
 
         // scope is intentional
         {
@@ -1989,6 +2017,7 @@ private:
     std::mutex queue_mutex;
 
     std::unordered_map<std::string, StreamState> stream_state;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> paced_call_first_deferred_at;
     std::unordered_map<std::string, P25CallState> p25_call_state;
     std::mutex p25_state_mutex;
 
@@ -2009,6 +2038,7 @@ private:
 
     uint64_t dropped_frames = 0;
     uint64_t dropped_mux_frames = 0;
+    uint64_t paced_timeout_drops = 0;
     uint32_t mux_stale_call_ms = 1500;
     uint32_t mux_force_call_ms = 12000;
 
