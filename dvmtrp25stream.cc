@@ -313,11 +313,11 @@ std::string make_call_key(const std::string& short_name, int sys_num, long call_
  * @param dst_tgid The destination TGID.
  * @returns std::string A unique mux lane key in the format "dst_tgid".
  */
-std::string make_mux_lane_key(const std::string &short_name, uint32_t dst_tgid) 
+std::string make_mux_lane_key(const std::string& route_key, const std::string &short_name, uint32_t dst_tgid) 
 {
-    (void)short_name;
     std::ostringstream oss;
-    oss << dst_tgid;
+    oss << short_name << ":" << dst_tgid;
+    oss << ":" << route_key;
     return oss.str();
 }
 
@@ -335,6 +335,17 @@ struct Route {
     std::string short_name;
 };
 
+std::string make_route_lane_key(const Route* route)
+{
+    if (route == nullptr) {
+        return "wildcard";
+    }
+
+    std::ostringstream oss;
+    oss << route->tgid << ":" << route->dstTgid << ":" << route->short_name;
+    return oss.str();
+}
+
 /**
  * @brief Represents the configuration for the FNE connection.
  */
@@ -351,6 +362,8 @@ struct FneConfig {
     uint32_t retryInterval = 3000;
     uint32_t maxMissedPings = 10;
     uint32_t pacedCallTimeoutMs = 10000;
+    uint32_t orphanCallTimeoutMs = 12000;
+    uint32_t endedCallCleanupMs = 30000;
 };
 
 
@@ -438,6 +451,12 @@ struct CallMuxState {
     bool active = false;
     bool queued = false;
     bool ended = false;
+    bool synthetic_end_queued = false;
+    bool header_valid = false;
+    bool encrypted = false;
+    bool next_is_ldu2 = false;
+    long source_tgid = 0;
+    P25MessageHdr header;
     std::chrono::steady_clock::time_point last_activity{};
 };
 
@@ -476,11 +495,19 @@ public:
         fne_config.retryInterval = (uint32_t)(fne.value("retryIntervalMs", fne_config.retryInterval));
         fne_config.maxMissedPings = (uint32_t)(fne.value("maxMissedPings", fne_config.maxMissedPings));
         fne_config.pacedCallTimeoutMs = (uint32_t)(fne.value("pacedCallTimeoutMs", fne_config.pacedCallTimeoutMs));
+        fne_config.orphanCallTimeoutMs = (uint32_t)(fne.value("orphanCallTimeoutMs", fne_config.orphanCallTimeoutMs));
+        fne_config.endedCallCleanupMs = (uint32_t)(fne.value("endedCallCleanupMs", fne_config.endedCallCleanupMs));
         if (fne_config.maxMissedPings == 0U) {
             fne_config.maxMissedPings = 10U;
         }
         if (fne_config.pacedCallTimeoutMs == 0U) {
             fne_config.pacedCallTimeoutMs = 10000U;
+        }
+        if (fne_config.orphanCallTimeoutMs < 1000U) {
+            fne_config.orphanCallTimeoutMs = 1000U;
+        }
+        if (fne_config.endedCallCleanupMs < 5000U) {
+            fne_config.endedCallCleanupMs = 5000U;
         }
 
         max_queue_depth = static_cast<size_t>(config_data.value("maxQueueDepth", 8192));
@@ -512,7 +539,9 @@ public:
                                 << ", peerId = " << fne_config.peerId
                                 << ", routes = " << routes.size()
                                 << ", maxMissedPings = " << fne_config.maxMissedPings
-                                << ", pacedCallTimeoutMs = " << fne_config.pacedCallTimeoutMs;
+                                << ", pacedCallTimeoutMs = " << fne_config.pacedCallTimeoutMs
+                                << ", orphanCallTimeoutMs = " << fne_config.orphanCallTimeoutMs
+                                << ", endedCallCleanupMs = " << fne_config.endedCallCleanupMs;
 
         return 0;
     }
@@ -595,7 +624,7 @@ public:
         }
 
         const uint32_t dst_tgid = resolve_dst_tgid(route, call_info.talkgroup);
-        const std::string fallback_lane_key = make_mux_lane_key(call_info.short_name, dst_tgid);
+        const std::string fallback_lane_key = make_mux_lane_key(make_route_lane_key(route), call_info.short_name, dst_tgid);
         const bool have_mux_state = has_mux_call_state(call_key);
         const std::string lane_key = resolve_lane_key_for_call(call_key, fallback_lane_key);
 
@@ -707,9 +736,17 @@ public:
             if (route != nullptr) {
                 actual_tgid = call_tgid;
             }
-        }
 
-        if (route == nullptr && callback_tgid > 0) {
+            // Do not fall back to callback TGID when call TGID is present.
+            // This prevents misrouting an unrouted call into a routed lane when
+            // callback metadata carries a stale or conflicting TGID.
+            if (route == nullptr && callback_tgid > 0 && callback_tgid != call_tgid) {
+                BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: dropping callback TGID fallback due to mismatch"
+                                         << ", callTg = " << call_tgid
+                                         << ", cbTg = " << callback_tgid
+                                         << ", shortName = " << short_name;
+            }
+        } else if (callback_tgid > 0) {
             route = find_route(callback_tgid, short_name, encrypted);
             if (route != nullptr) {
                 actual_tgid = callback_tgid;
@@ -725,7 +762,7 @@ public:
         }
 
         const uint32_t dst_tgid = resolve_dst_tgid(route, actual_tgid);
-        const std::string lane_key = make_mux_lane_key(short_name, dst_tgid);
+        const std::string lane_key = make_mux_lane_key(make_route_lane_key(route), short_name, dst_tgid);
 
         const long current_src = call->get_current_source_id();
         uint32_t effective_src = 0U;
@@ -753,11 +790,15 @@ public:
         const int sys_num = static_cast<int>(system->get_sys_id() & 0xFFFFU);
         const std::string call_key = make_call_key(short_name, sys_num, call->get_call_num(), actual_tgid);
 
+        supersede_calls_for_source_tgid(lane_key, actual_tgid, call_key);
+
         P25CallState ready_state;
         bool emit_ldu = false;
         bool emit_ldu2 = false;
         bool queue_leading_silence = false;
         P25MessageHdr leading_header;
+        P25MessageHdr current_header;
+        bool current_next_is_ldu2 = false;
 
         // scope is intentional
         {
@@ -779,6 +820,8 @@ public:
             // Keep IDs pinned to validated callback-local values for this frame.
             state.header.srcId = normalized_src;
             state.header.dstId = normalized_dst;
+            current_header = state.header;
+            current_next_is_ldu2 = state.nextIsLDU2;
 
               if (!state.leading_silence_sent && state.imbeCount == 0U) {
                   state.leading_silence_sent = true;
@@ -799,6 +842,8 @@ public:
             }
         }
 
+        update_call_mux_state_from_voice(call_key, lane_key, actual_tgid, current_header, encrypted, current_next_is_ldu2);
+
         if (queue_leading_silence) {
             BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: call route"
                                     << ", callKey = " << call_key
@@ -806,6 +851,8 @@ public:
                                     << ", dstTg = " << dst_tgid
                                     << ", sysId = " << sys_num
                                     << ", shortName = " << short_name;
+
+            update_call_mux_state_from_voice(call_key, lane_key, actual_tgid, leading_header, encrypted, false);
             queue_silence_ldu_pair(lane_key, call_key, leading_header, encrypted, false);
         }
 
@@ -839,6 +886,8 @@ public:
             }
 
             schedule_mux_frame(lane_key, call_key, std::move(frame));
+
+            update_call_mux_state_from_voice(call_key, lane_key, actual_tgid, ready_state.header, encrypted, emit_ldu2 ? false : true);
 
             BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: queued " << (emit_ldu2 ? "LDU2" : "LDU1")
                                      << ", callKey = " << call_key
@@ -926,6 +975,247 @@ private:
         second.end_of_call = false;
         second.payload = build_ldu_payload(silence_state, !start_with_ldu2);
         schedule_mux_frame(lane_key, call_key, std::move(second));
+    }
+
+    struct SyntheticEndRequest {
+        std::string call_key;
+        std::string lane_key;
+        long source_tgid = 0;
+        bool encrypted = false;
+        bool start_with_ldu2 = false;
+        bool header_valid = false;
+        P25MessageHdr header;
+    };
+
+    /**
+     * @brief Creates a synthetic end request from the current call mux state.
+     * @param call_key The call key for the request.
+     * @param state The current call mux state.
+     * @returns SyntheticEndRequest The constructed synthetic end request.
+     */
+    SyntheticEndRequest make_synthetic_end_request_locked(const std::string& call_key, const CallMuxState& state) {
+        SyntheticEndRequest req;
+        req.call_key = call_key;
+        req.lane_key = state.lane_key;
+        req.source_tgid = state.source_tgid;
+        req.encrypted = state.encrypted;
+        req.start_with_ldu2 = state.next_is_ldu2;
+        req.header_valid = state.header_valid;
+        req.header = state.header;
+        return req;
+    }
+
+    /**
+     * @brief Updates the call mux state based on voice frame information.
+     * @param call_key The call key for the state to update.
+     * @param lane_key The lane key for the state to update.
+     * @param source_tgid The source talkgroup ID.
+     * @param header The message header to apply.
+     * @param encrypted Whether the call is encrypted.
+     * @param next_is_ldu2 Whether the next frame is an LDU2.
+     */
+    void update_call_mux_state_from_voice(const std::string& call_key, const std::string& lane_key,
+        long source_tgid, const P25MessageHdr& header, bool encrypted, bool next_is_ldu2) {
+        std::lock_guard<std::mutex> lock(mux_mutex);
+        const auto now = std::chrono::steady_clock::now();
+
+        CallMuxState& state = call_mux_state[call_key];
+        state.lane_key = lane_key;
+        state.source_tgid = source_tgid;
+        state.header = header;
+        state.header_valid = true;
+        state.encrypted = encrypted;
+        state.next_is_ldu2 = next_is_ldu2;
+        state.last_activity = now;
+        state.synthetic_end_queued = false;
+        if (!state.ended) {
+            state.active = (mux_lane_state[lane_key].active_call_key == call_key);
+        }
+    }
+
+    /**
+     * @brief Removes a waiting call from the lane state.
+     * @param lane The lane state to modify.
+     * @param call_key The call key to remove from the waiting calls.
+     */
+    void remove_waiting_call_locked(MuxLaneState& lane, const std::string& call_key) {
+        lane.waiting_calls.erase(
+            std::remove(lane.waiting_calls.begin(), lane.waiting_calls.end(), call_key),
+            lane.waiting_calls.end());
+    }
+
+    /**
+     * @brief Erases call tracking information for a given call and lane.
+     * @param call_key The call key to erase.
+     * @param lane_key The lane key associated with the call.
+     */
+    void erase_call_tracking_locked(const std::string& call_key, const std::string& lane_key) {
+        auto lane_it = mux_lane_state.find(lane_key);
+        if (lane_it != mux_lane_state.end()) {
+            remove_waiting_call_locked(lane_it->second, call_key);
+            if (lane_it->second.active_call_key == call_key) {
+                lane_it->second.active_call_key.clear();
+            }
+
+            if (lane_it->second.active_call_key.empty() && lane_it->second.waiting_calls.empty()) {
+                mux_lane_state.erase(lane_it);
+            }
+        }
+
+        call_mux_state.erase(call_key);
+        mux_buffered_frames.erase(call_key);
+    }
+
+    /**
+     * @brief Injects a synthetic end request into the stream.
+     * @param req The synthetic end request to inject.
+     * @param reason The reason for the synthetic end injection.
+     */
+    void inject_synthetic_end_request(const SyntheticEndRequest& req, const char* reason) {
+        P25CallState state;
+        bool have_state = false;
+
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> lock(p25_state_mutex);
+            auto it = p25_call_state.find(req.call_key);
+            if (it != p25_call_state.end()) {
+                state = it->second;
+                p25_call_state.erase(it);
+                have_state = true;
+            }
+        }
+
+        P25MessageHdr header;
+        if (have_state) {
+            header = state.header;
+        } else if (req.header_valid) {
+            header = req.header;
+        } else {
+            BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: synthetic end skipped due to missing header"
+                                       << ", callKey = " << req.call_key
+                                       << ", lane = " << req.lane_key
+                                       << ", reason = " << reason;
+            return;
+        }
+
+        if (have_state && state.imbeCount > 0U) {
+            const uint8_t* null_frame = req.encrypted ? ENCRYPTED_NULL_IMBE : NULL_IMBE;
+            while (state.imbeCount < 9U) {
+                std::memcpy(state.imbe[state.imbeCount].data(), null_frame, RAW_IMBE_LENGTH_BYTES);
+                state.imbeCount++;
+            }
+
+            OutboundFrame ldu_frame;
+            ldu_frame.call_key = req.call_key;
+            ldu_frame.end_of_call = false;
+            ldu_frame.payload = build_ldu_payload(state, req.start_with_ldu2);
+            schedule_mux_frame(req.lane_key, req.call_key, std::move(ldu_frame));
+        }
+
+        queue_silence_ldu_pair(req.lane_key, req.call_key, header, req.encrypted, req.start_with_ldu2);
+
+        OutboundFrame frame;
+        frame.call_key = req.call_key;
+        frame.payload = build_tdu_payload(header);
+        frame.end_of_call = true;
+        schedule_mux_frame(req.lane_key, req.call_key, std::move(frame));
+        mark_mux_call_ended(req.call_key, req.lane_key);
+
+        BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: injected synthetic end"
+                                   << ", reason = " << reason
+                                   << ", callKey = " << req.call_key
+                                   << ", lane = " << req.lane_key
+                                   << ", sourceTg = " << req.source_tgid;
+    }
+
+    /**
+     * @brief Supersedes any existing calls for the same source TGID with a new call.
+     * @param lane_key The lane key for the calls.
+     * @param source_tgid The source talkgroup ID to match.
+     * @param new_call_key The new call key that supersedes existing calls.
+     */
+    void supersede_calls_for_source_tgid(const std::string& lane_key, long source_tgid, const std::string& new_call_key) {
+        std::vector<SyntheticEndRequest> superseded;
+
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> lock(mux_mutex);
+            for (auto& pair : call_mux_state) {
+                const std::string& existing_call_key = pair.first;
+                CallMuxState& state = pair.second;
+
+                if (existing_call_key == new_call_key) {
+                    continue;
+                }
+
+                if (state.lane_key != lane_key || state.source_tgid != source_tgid) {
+                    continue;
+                }
+
+                if (state.ended || state.synthetic_end_queued) {
+                    continue;
+                }
+
+                state.synthetic_end_queued = true;
+                superseded.push_back(make_synthetic_end_request_locked(existing_call_key, state));
+            }
+        }
+
+        for (const auto& req : superseded) {
+            inject_synthetic_end_request(req, "superseded-by-new-call-same-source-tgid");
+        }
+    }
+
+    /**
+     * @brief Reaps orphaned calls that have exceeded the configured timeout.
+     * This function checks the last activity timestamp of each call in the mux state.
+     * If a call has not had any activity for longer than the orphanCallTimeoutMs,
+     * it is considered orphaned and a synthetic end request is generated for it.
+     * Additionally, calls that have ended and exceeded the endedCallCleanupMs are cleaned up from
+     * the mux state to free resources.
+     */
+    void reap_orphan_calls() {
+        const auto now = std::chrono::steady_clock::now();
+        const auto orphan_after = std::chrono::milliseconds(fne_config.orphanCallTimeoutMs);
+        const auto cleanup_after = std::chrono::milliseconds(fne_config.endedCallCleanupMs);
+
+        std::vector<SyntheticEndRequest> orphaned;
+        std::vector<std::pair<std::string, std::string>> stale_ended;
+
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> lock(mux_mutex);
+
+            for (auto& pair : call_mux_state) {
+                const std::string& call_key = pair.first;
+                CallMuxState& state = pair.second;
+
+                if (state.last_activity.time_since_epoch().count() == 0) {
+                    continue;
+                }
+
+                const auto age = now - state.last_activity;
+
+                if (!state.ended && !state.synthetic_end_queued && age > orphan_after) {
+                    state.synthetic_end_queued = true;
+                    orphaned.push_back(make_synthetic_end_request_locked(call_key, state));
+                    continue;
+                }
+
+                if (state.ended && age > cleanup_after) {
+                    stale_ended.emplace_back(call_key, state.lane_key);
+                }
+            }
+
+            for (const auto& stale : stale_ended) {
+                erase_call_tracking_locked(stale.first, stale.second);
+            }
+        }
+
+        for (const auto& req : orphaned) {
+            inject_synthetic_end_request(req, "orphan-timeout");
+        }
     }
 
     /**
@@ -1104,6 +1394,7 @@ private:
         }
 
         if (lane.active_call_key == call_key) {
+            call_state.ended = false;
             call_state.active = true;
             call_state.queued = false;
             call_state.last_activity = now;
@@ -1115,6 +1406,7 @@ private:
             lane.waiting_calls.push_back(call_key);
             call_state.queued = true;
             call_state.active = false;
+            call_state.ended = false;
         }
 
         // Track queued-call freshness so stale promotion can recover if call_end
@@ -1183,6 +1475,7 @@ private:
         }
 
         call_it->second.ended = true;
+        call_it->second.synthetic_end_queued = false;
         call_it->second.last_activity = std::chrono::steady_clock::now();
 
         if (call_it->second.active) {
@@ -1494,6 +1787,9 @@ private:
         }
 
         std::deque<OutboundFrame>& lane_queue = lane_queues[lane_key];
+        if (!frame.end_of_call) {
+            pending_non_end_frames[frame.call_key]++;
+        }
         lane_queue.push_back(std::move(frame));
         queue_size++;
 
@@ -1560,6 +1856,9 @@ private:
         }
 
         std::deque<OutboundFrame>& lane_queue = lane_queues[lane_key];
+        if (!frame.end_of_call) {
+            pending_non_end_frames[frame.call_key]++;
+        }
         lane_queue.push_back(std::move(frame));
         queue_size++;
 
@@ -1573,16 +1872,23 @@ private:
      * @param call_key Per-call key.
      * @returns bool True when unsent non-end frames remain in the outbound queue.
      */
-    bool has_pending_non_end_frames_for_call(const std::string& call_key) {
-        std::lock_guard<std::mutex> lock(queue_mutex);
-        for (const auto& lane_pair : lane_queues) {
-            for (const auto& frame : lane_pair.second) {
-                if (frame.call_key == call_key && !frame.end_of_call) {
-                    return true;
-                }
-            }
+    bool has_pending_non_end_frames_for_call_locked(const std::string& call_key) const {
+        auto it = pending_non_end_frames.find(call_key);
+        return it != pending_non_end_frames.end() && it->second > 0U;
+    }
+
+    bool is_non_end_frame_ready(const std::string& call_key, const std::chrono::steady_clock::time_point& now) const {
+        auto it = stream_state.find(call_key);
+        if (it == stream_state.end()) {
+            return true;
         }
-        return false;
+
+        const auto& next_send_at = it->second.next_protocol_send_at;
+        if (next_send_at.time_since_epoch().count() == 0) {
+            return true;
+        }
+
+        return now >= next_send_at;
     }
 
     /**
@@ -1590,7 +1896,7 @@ private:
      * @param out Reference to the OutboundFrame where the popped frame will be stored.
      * @returns bool True if a frame was successfully popped, false if the queue was empty
      */
-    bool pop_frame(OutboundFrame& out) {
+    bool pop_ready_frame(OutboundFrame& out, const std::chrono::steady_clock::time_point& now) {
         std::lock_guard<std::mutex> lock(queue_mutex);
         if (queue_size == 0U || lane_rr.empty()) {
             return false;
@@ -1607,9 +1913,31 @@ private:
                 continue;
             }
 
+            const OutboundFrame& candidate = it->second.front();
+            if (!candidate.end_of_call && !is_non_end_frame_ready(candidate.call_key, now)) {
+                lane_rr.push_back(lane_key);
+                continue;
+            }
+
+            if (candidate.end_of_call && has_pending_non_end_frames_for_call_locked(candidate.call_key)) {
+                lane_rr.push_back(lane_key);
+                continue;
+            }
+
             out = std::move(it->second.front());
             it->second.pop_front();
             queue_size--;
+
+            if (!out.end_of_call) {
+                auto count_it = pending_non_end_frames.find(out.call_key);
+                if (count_it != pending_non_end_frames.end()) {
+                    if (count_it->second > 1U) {
+                        count_it->second--;
+                    } else {
+                        pending_non_end_frames.erase(count_it);
+                    }
+                }
+            }
 
             if (!it->second.empty()) {
                 lane_rr.push_back(lane_key);
@@ -1661,57 +1989,18 @@ private:
             recv_control_packets();
             handle_session_timers();
             promote_stale_mux_lanes();
+            reap_orphan_calls();
 
             if (net_state == NET_STAT_RUNNING) {
-                OutboundFrame frame;
-                std::deque<OutboundFrame> deferred_frames;
-                std::unordered_set<std::string> deferred_non_end_calls;
                 int sends = 0;
-                int attempts = 0;
-                while (attempts < 64 && pop_frame(frame)) {
-                    attempts++;
-
-                    // preserve per-call ordering inside this tick: if we already deferred
-                    // non-end voice for a call, do not allow its end marker to pass it
-                    if (frame.end_of_call && deferred_non_end_calls.find(frame.call_key) != deferred_non_end_calls.end()) {
-                        deferred_frames.push_back(std::move(frame));
-                        continue;
+                while (sends < 64) {
+                    OutboundFrame frame;
+                    if (!pop_ready_frame(frame, std::chrono::steady_clock::now())) {
+                        break;
                     }
 
-                    if (!send_protocol_frame(frame)) {
-                        if (!frame.end_of_call) {
-                            const auto now = std::chrono::steady_clock::now();
-                            auto it = paced_call_first_deferred_at.find(frame.call_key);
-                            if (it == paced_call_first_deferred_at.end()) {
-                                paced_call_first_deferred_at[frame.call_key] = now;
-                            } else {
-                                const uint64_t elapsed_ms = (uint64_t)(std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count());
-                                if (elapsed_ms >= (uint64_t)(fne_config.pacedCallTimeoutMs)) {
-                                    paced_timeout_drops++;
-                                    if ((paced_timeout_drops % 100U) == 0U) {
-                                        BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: dropping paced call frame after timeout"
-                                                                   << ", callKey = " << frame.call_key
-                                                                   << ", elapsedMs = " << elapsed_ms
-                                                                   << ", timeoutMs = " << fne_config.pacedCallTimeoutMs
-                                                                   << ", drops = " << paced_timeout_drops;
-                                    }
-                                    continue;
-                                }
-                            }
-
-                            deferred_non_end_calls.insert(frame.call_key);
-                        }
-                        deferred_frames.push_back(std::move(frame));
-                        continue;
-                    }
-
-                    paced_call_first_deferred_at.erase(frame.call_key);
+                    send_protocol_frame(frame);
                     sends++;
-                }
-
-                while (!deferred_frames.empty()) {
-                    requeue_frame_back(std::move(deferred_frames.front()));
-                    deferred_frames.pop_front();
                 }
             }
 
@@ -1975,12 +2264,6 @@ private:
         const auto now = std::chrono::steady_clock::now();
 
         if (frame.end_of_call) {
-            // preserve per-call ordering: never let the TDU overtake queued
-            // voice/silence LDUs for the same call
-            if (has_pending_non_end_frames_for_call(frame.call_key)) {
-                return false;
-            }
-
             if (it == stream_state.end()) {
                 StreamState& created = stream_state[frame.call_key];
                 created.streamId = random_stream_id();
@@ -1998,13 +2281,6 @@ private:
                 created.next_protocol_send_at = now;
             }
             stream = &created;
-
-            // LDU frames represent ~180 ms of audio; pacing avoids burst sends
-            // that destabilize voice continuity at the receiver
-            if (stream->next_protocol_send_at.time_since_epoch().count() != 0 &&
-                now < stream->next_protocol_send_at) {
-                return false;
-            }
         }
 
         const uint16_t seq = next_seq(frame.end_of_call);
@@ -2118,16 +2394,6 @@ private:
         login_stream_id = 0;
         std::memset(salt, 0x00, sizeof(salt));
         stream_state.clear();
-        paced_call_first_deferred_at.clear();
-
-        // scope is intentional
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex);
-            lane_queues.clear();
-            lane_rr.clear();
-            lane_in_rr.clear();
-            queue_size = 0U;
-        }
 
         // scope is intentional
         {
@@ -2135,6 +2401,16 @@ private:
             mux_lane_state.clear();
             call_mux_state.clear();
             mux_buffered_frames.clear();
+        }
+
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            lane_queues.clear();
+            lane_rr.clear();
+            lane_in_rr.clear();
+            pending_non_end_frames.clear();
+            queue_size = 0U;
         }
 
         // scope is intentional
@@ -2164,11 +2440,11 @@ private:
     std::unordered_map<std::string, std::deque<OutboundFrame>> lane_queues;
     std::deque<std::string> lane_rr;
     std::unordered_set<std::string> lane_in_rr;
+    std::unordered_map<std::string, size_t> pending_non_end_frames;
     size_t queue_size = 0;
     std::mutex queue_mutex;
 
     std::unordered_map<std::string, StreamState> stream_state;
-    std::unordered_map<std::string, std::chrono::steady_clock::time_point> paced_call_first_deferred_at;
     std::unordered_map<std::string, P25CallState> p25_call_state;
     std::mutex p25_state_mutex;
 
@@ -2189,7 +2465,6 @@ private:
 
     uint64_t dropped_frames = 0;
     uint64_t dropped_mux_frames = 0;
-    uint64_t paced_timeout_drops = 0;
     uint32_t mux_stale_call_ms = 1500;
     uint32_t mux_force_call_ms = 12000;
 
