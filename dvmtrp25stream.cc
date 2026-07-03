@@ -307,15 +307,16 @@ std::string make_call_key(const std::string& short_name, long call_num)
 }
 
 /**
- * @brief Generates a unique mux lane key based on the short name and destination TGID.
- * @param short_name The short name associated with the mux lane.
+ * @brief Generates a mux lane key based only on destination TGID.
+ * @param short_name Unused (preserved for caller compatibility).
  * @param dst_tgid The destination TGID.
- * @returns std::string A unique mux lane key in the format "short_name:dst_tgid".
+ * @returns std::string A unique mux lane key in the format "dst_tgid".
  */
 std::string make_mux_lane_key(const std::string &short_name, uint32_t dst_tgid) 
 {
+    (void)short_name;
     std::ostringstream oss;
-    oss << short_name << ":" << dst_tgid;
+    oss << dst_tgid;
     return oss.str();
 }
 
@@ -402,6 +403,7 @@ struct P25CallState {
 
 struct OutboundFrame {
     std::string call_key;
+    std::string lane_key;
     std::vector<uint8_t> payload;
     bool end_of_call = false;
 };
@@ -1080,6 +1082,8 @@ private:
         std::lock_guard<std::mutex> lock(mux_mutex);
         const auto now = std::chrono::steady_clock::now();
 
+        frame.lane_key = lane_key;
+
         CallMuxState& call_state = call_mux_state[call_key];
         call_state.lane_key = lane_key;
 
@@ -1423,15 +1427,67 @@ private:
      */
     void enqueue_frame(OutboundFrame frame) {
         std::lock_guard<std::mutex> lock(queue_mutex);
-        if (queue.size() >= max_queue_depth) {
-            queue.pop_front();
+        std::string lane_key = frame.lane_key;
+        if (lane_key.empty()) {
+            lane_key = "__default";
+            frame.lane_key = lane_key;
+        }
+
+        if (queue_size >= max_queue_depth) {
+            bool dropped = false;
+
+            auto own_it = lane_queues.find(lane_key);
+            if (own_it != lane_queues.end() && !own_it->second.empty()) {
+                own_it->second.pop_front();
+                queue_size--;
+                if (own_it->second.empty()) {
+                    lane_queues.erase(own_it);
+                    lane_in_rr.erase(lane_key);
+                    auto rr_it = std::find(lane_rr.begin(), lane_rr.end(), lane_key);
+                    if (rr_it != lane_rr.end()) {
+                        lane_rr.erase(rr_it);
+                    }
+                }
+                dropped = true;
+            }
+
+            if (!dropped) {
+                for (const auto& rr_lane : lane_rr) {
+                    auto it = lane_queues.find(rr_lane);
+                    if (it != lane_queues.end() && !it->second.empty()) {
+                        it->second.pop_front();
+                        queue_size--;
+                        if (it->second.empty()) {
+                            lane_queues.erase(it);
+                            lane_in_rr.erase(rr_lane);
+                            auto rr_it = std::find(lane_rr.begin(), lane_rr.end(), rr_lane);
+                            if (rr_it != lane_rr.end()) {
+                                lane_rr.erase(rr_it);
+                            }
+                        }
+                        dropped = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!dropped) {
+                return;
+            }
+
             dropped_frames++;
             if ((dropped_frames % 100U) == 0U) {
                 BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: queue overflow, dropped frames=" << dropped_frames;
             }
         }
 
-        queue.push_back(std::move(frame));
+        std::deque<OutboundFrame>& lane_queue = lane_queues[lane_key];
+        lane_queue.push_back(std::move(frame));
+        queue_size++;
+
+        if (lane_in_rr.insert(lane_key).second) {
+            lane_rr.push_back(lane_key);
+        }
     }
 
     /**
@@ -1440,12 +1496,64 @@ private:
      */
     void requeue_frame_back(OutboundFrame frame) {
         std::lock_guard<std::mutex> lock(queue_mutex);
-        if (queue.size() >= max_queue_depth) {
-            queue.pop_back();
+        std::string lane_key = frame.lane_key;
+        if (lane_key.empty()) {
+            lane_key = "__default";
+            frame.lane_key = lane_key;
+        }
+
+        if (queue_size >= max_queue_depth) {
+            bool dropped = false;
+
+            auto own_it = lane_queues.find(lane_key);
+            if (own_it != lane_queues.end() && !own_it->second.empty()) {
+                own_it->second.pop_back();
+                queue_size--;
+                if (own_it->second.empty()) {
+                    lane_queues.erase(own_it);
+                    lane_in_rr.erase(lane_key);
+                    auto rr_it = std::find(lane_rr.begin(), lane_rr.end(), lane_key);
+                    if (rr_it != lane_rr.end()) {
+                        lane_rr.erase(rr_it);
+                    }
+                }
+                dropped = true;
+            }
+
+            if (!dropped) {
+                for (auto rr_it = lane_rr.rbegin(); rr_it != lane_rr.rend(); ++rr_it) {
+                    auto it = lane_queues.find(*rr_it);
+                    if (it != lane_queues.end() && !it->second.empty()) {
+                        it->second.pop_back();
+                        queue_size--;
+                        if (it->second.empty()) {
+                            lane_in_rr.erase(*rr_it);
+                            auto erase_it = std::find(lane_rr.begin(), lane_rr.end(), *rr_it);
+                            if (erase_it != lane_rr.end()) {
+                                lane_rr.erase(erase_it);
+                            }
+                            lane_queues.erase(it);
+                        }
+                        dropped = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!dropped) {
+                return;
+            }
+
             dropped_frames++;
         }
 
-        queue.push_back(std::move(frame));
+        std::deque<OutboundFrame>& lane_queue = lane_queues[lane_key];
+        lane_queue.push_back(std::move(frame));
+        queue_size++;
+
+        if (lane_in_rr.insert(lane_key).second) {
+            lane_rr.push_back(lane_key);
+        }
     }
 
     /**
@@ -1455,9 +1563,11 @@ private:
      */
     bool has_pending_non_end_frames_for_call(const std::string& call_key) {
         std::lock_guard<std::mutex> lock(queue_mutex);
-        for (const auto& frame : queue) {
-            if (frame.call_key == call_key && !frame.end_of_call) {
-                return true;
+        for (const auto& lane_pair : lane_queues) {
+            for (const auto& frame : lane_pair.second) {
+                if (frame.call_key == call_key && !frame.end_of_call) {
+                    return true;
+                }
             }
         }
         return false;
@@ -1470,13 +1580,36 @@ private:
      */
     bool pop_frame(OutboundFrame& out) {
         std::lock_guard<std::mutex> lock(queue_mutex);
-        if (queue.empty()) {
+        if (queue_size == 0U || lane_rr.empty()) {
             return false;
         }
-        
-        out = std::move(queue.front());
-        queue.pop_front();
-        return true;
+
+        size_t lanes_to_scan = lane_rr.size();
+        while (lanes_to_scan-- > 0 && !lane_rr.empty()) {
+            const std::string lane_key = lane_rr.front();
+            lane_rr.pop_front();
+
+            auto it = lane_queues.find(lane_key);
+            if (it == lane_queues.end() || it->second.empty()) {
+                lane_in_rr.erase(lane_key);
+                continue;
+            }
+
+            out = std::move(it->second.front());
+            it->second.pop_front();
+            queue_size--;
+
+            if (!it->second.empty()) {
+                lane_rr.push_back(lane_key);
+            } else {
+                lane_in_rr.erase(lane_key);
+                lane_queues.erase(it);
+            }
+
+            return true;
+        }
+
+        return false;
     }
 
     /**
@@ -1983,6 +2116,15 @@ private:
 
         // scope is intentional
         {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            lane_queues.clear();
+            lane_rr.clear();
+            lane_in_rr.clear();
+            queue_size = 0U;
+        }
+
+        // scope is intentional
+        {
             std::lock_guard<std::mutex> lock(mux_mutex);
             mux_lane_state.clear();
             call_mux_state.clear();
@@ -2013,7 +2155,10 @@ private:
     std::atomic<bool> running{false};
     std::thread worker;
 
-    std::deque<OutboundFrame> queue;
+    std::unordered_map<std::string, std::deque<OutboundFrame>> lane_queues;
+    std::deque<std::string> lane_rr;
+    std::unordered_set<std::string> lane_in_rr;
+    size_t queue_size = 0;
     std::mutex queue_mutex;
 
     std::unordered_map<std::string, StreamState> stream_state;

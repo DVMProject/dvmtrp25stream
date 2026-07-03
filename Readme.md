@@ -22,7 +22,7 @@ For more information, see https://github.com/TrunkRecorder/trunk-recorder/blob/m
 - Not designed to carry P25 TDMA audio.
 - It supports multiple active talkgroups at the same time.
 - Route matching is done by TGID and optional system `shortName`.
-- Routes sharing the same destination lane (`shortName` + `dstTgid`) are serialized one call at a time (FIFO), so many-to-one mux introduces delivery delay.
+- Routes sharing the same destination lane (`dstTgid`) are serialized one call at a time (FIFO), so many-to-one mux introduces delivery delay.
 - Requires `audioStreaming: true` in trunk-recorder config to ensure real-time audio/call plumbing is active.
 
 ## Example Plugin Config
@@ -39,7 +39,7 @@ For more information, see https://github.com/TrunkRecorder/trunk-recorder/blob/m
     "identity": "trunk-recorder",
     "maxMissedPings": 10,
     "retryIntervalMs": 3000,
-    "pacedCallTimeoutMs": 10000
+    "pacedCallTimeoutMs": 10000,
     "debug": false
   },
   "maxQueueDepth": 8192,
@@ -66,6 +66,7 @@ For more information, see https://github.com/TrunkRecorder/trunk-recorder/blob/m
 - Ping cadence is fixed by FNE protocol and is not configurable in dvmtrp25stream.
 - `maxMissedPings`: number of consecutive keepalive `PING` messages that do not receive a `PONG` response before the session is reset and reconnect is attempted.
 - `retryIntervalMs`: reconnect/login retry interval after session reset or startup.
+- `pacedCallTimeoutMs`: max time to keep requeueing a paced call before dropping its blocked frames (default 10000 ms).
 
 ## Example Muxed Talkgroups
 
