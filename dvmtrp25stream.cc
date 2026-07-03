@@ -1185,7 +1185,7 @@ private:
 
         header.mfid = MFG_STANDARD;
 
-        header.netId = (uint32_t)(system->get_wacn() & 0x00FF0000UL);
+        header.netId = (uint32_t)(system->get_wacn() & 0x00FFF000UL);
         header.netId |= (uint32_t)(system->get_sys_id() & 0x0000FFFFUL);
 
         header.lsd1 = 0x00U;
