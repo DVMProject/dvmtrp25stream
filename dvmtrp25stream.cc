@@ -1185,7 +1185,8 @@ private:
 
         header.mfid = MFG_STANDARD;
 
-        header.netId = (uint32_t)(system->get_wacn() & 0x00FFFFFFUL);
+        header.netId = (uint32_t)(system->get_wacn() & 0x00FF0000UL);
+        header.netId |= (uint32_t)(system->get_sys_id() & 0x0000FFFFUL);
 
         header.lsd1 = 0x00U;
         header.lsd2 = 0x00U;
@@ -1511,13 +1512,19 @@ private:
 
             if (net_state == NET_STAT_RUNNING) {
                 OutboundFrame frame;
+                std::deque<OutboundFrame> deferred_frames;
                 int sends = 0;
                 while (sends < 64 && pop_frame(frame)) {
                     if (!send_protocol_frame(frame)) {
-                        requeue_frame_front(std::move(frame));
-                        break;
+                        deferred_frames.push_back(std::move(frame));
+                        continue;
                     }
                     sends++;
+                }
+
+                while (!deferred_frames.empty()) {
+                    requeue_frame_front(std::move(deferred_frames.back()));
+                    deferred_frames.pop_back();
                 }
             }
 
