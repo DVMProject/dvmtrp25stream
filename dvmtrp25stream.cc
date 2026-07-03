@@ -299,10 +299,11 @@ uint16_t CRC16_CCITT(const uint8_t *data, size_t len)
  * @param call_num The call number.
  * @returns std::string A unique call key in the format "short_name:call_num".
  */
-std::string make_call_key(const std::string& short_name, long call_num) 
+std::string make_call_key(const std::string& short_name, int sys_num, long call_num, long source_tgid)
 {
     std::ostringstream oss;
-    oss << short_name << ":" << call_num;
+    const long normalized_tgid = (source_tgid < 0) ? 0 : source_tgid;
+    oss << short_name << ":" << sys_num << ":" << call_num << ":" << normalized_tgid;
     return oss.str();
 }
 
@@ -350,7 +351,6 @@ struct FneConfig {
     uint32_t retryInterval = 3000;
     uint32_t maxMissedPings = 10;
     uint32_t pacedCallTimeoutMs = 10000;
-    bool debug = false;
 };
 
 
@@ -462,8 +462,8 @@ public:
      */
     int parse_config(json config_data) override {
         if (!config_data.contains("fne") || !config_data["fne"].is_object()) {
-        BOOST_LOG_TRIVIAL(error) << "dvmtrp25stream: missing required fne config object";
-        return -1;
+            BOOST_LOG_TRIVIAL(error) << "dvmtrp25stream: missing required fne config object";
+            return -1;
         }
 
         json fne = config_data["fne"];
@@ -482,7 +482,6 @@ public:
         if (fne_config.pacedCallTimeoutMs == 0U) {
             fne_config.pacedCallTimeoutMs = 10000U;
         }
-        fne_config.debug = fne.value("debug", false);
 
         max_queue_depth = static_cast<size_t>(config_data.value("maxQueueDepth", 8192));
 
@@ -511,9 +510,9 @@ public:
 
         BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: configured for FNE " << fne_config.address << ":" << fne_config.port
                                 << ", peerId = " << fne_config.peerId
-                                 << ", routes = " << routes.size()
-                                   << ", maxMissedPings = " << fne_config.maxMissedPings
-                                   << ", pacedCallTimeoutMs = " << fne_config.pacedCallTimeoutMs;
+                                << ", routes = " << routes.size()
+                                << ", maxMissedPings = " << fne_config.maxMissedPings
+                                << ", pacedCallTimeoutMs = " << fne_config.pacedCallTimeoutMs;
 
         return 0;
     }
@@ -578,7 +577,7 @@ public:
      * @returns int 0 on success, non-zero on failure.
      */
     int call_end(Call_Data_t call_info) override {
-        const std::string call_key = make_call_key(call_info.short_name, call_info.call_num);
+        const std::string call_key = make_call_key(call_info.short_name, call_info.sys_num, call_info.call_num, call_info.talkgroup);
         const Route *route = find_route(call_info.talkgroup, call_info.short_name, call_info.encrypted);
 
         P25CallState state;
@@ -597,13 +596,24 @@ public:
 
         const uint32_t dst_tgid = resolve_dst_tgid(route, call_info.talkgroup);
         const std::string fallback_lane_key = make_mux_lane_key(call_info.short_name, dst_tgid);
+        const bool have_mux_state = has_mux_call_state(call_key);
         const std::string lane_key = resolve_lane_key_for_call(call_key, fallback_lane_key);
 
-        if (!route && !have_state && !has_mux_call_state(call_key)) {
-            if (fne_config.debug) {
-                BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: call_end no route/state, callKey = " << call_key
-                                         << ", tgid = " << call_info.talkgroup
-                                         << ", shortName = " << call_info.short_name;
+        // Guard against false call_end callbacks (for non-P25 or otherwise
+        // unrouted calls): do not synthesize end frames unless this call had
+        // real voice/mux state in this plugin.
+        if (!have_state && !have_mux_state) {
+            if (route != nullptr) {
+                BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: call_end route matched but no voice/mux state, skipping end injection"
+                                           << ", callKey = " << call_key
+                                           << ", tgid = " << call_info.talkgroup
+                                           << ", sysId = " << call_info.sys_num
+                                           << ", shortName = " << call_info.short_name;
+            } else {
+                BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: call_end no route/state, callKey = " << call_key
+                                           << ", tgid = " << call_info.talkgroup
+                                           << ", sysId = " << call_info.sys_num
+                                           << ", shortName = " << call_info.short_name;
             }
             return 0;
         }
@@ -627,10 +637,17 @@ public:
             header = state.header;
         } else {
             header.lco = P25_LCO_GROUP;
-            header.srcId = call_info.source_num & 0x00FFFFFFU;
+            header.srcId = (call_info.source_num > 0) ? ((uint32_t)(call_info.source_num) & 0x00FFFFFFU) : 0U;
             header.dstId = dst_tgid;
             header.sysId = static_cast<uint16_t>(call_info.sys_num & 0xFFFFU);
             header.serviceOptions = call_info.encrypted ? 0x40U : 0x00U;
+
+            if (header.srcId == 0U) {
+                BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: call_end using fallback header with missing source ID"
+                                           << ", callKey = " << call_key
+                                           << ", dstTg = " << header.dstId
+                                           << ", sysId = " << header.sysId;
+            }
         }
 
         queue_silence_ldu_pair(lane_key, call_key, header, call_info.encrypted, have_state ? state.nextIsLDU2 : false);
@@ -642,10 +659,8 @@ public:
         schedule_mux_frame(lane_key, call_key, std::move(frame));
         mark_mux_call_ended(call_key, lane_key);
 
-        if (fne_config.debug) {
-            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: queued TDU, callKey = " << call_key
-                                     << ", dstTg = " << header.dstId;
-        }
+        BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: queued TDU, callKey = " << call_key
+                                 << ", dstTg = " << header.dstId;
         return 0;
     }
 
@@ -663,25 +678,19 @@ public:
     int voice_codec_data(Call* call, int codec_type, long tgid, uint32_t src_id, const uint32_t* params, int param_count, int errs) override {
         (void)errs;
         if (!call || !params || param_count <= 0) {
-            if (fne_config.debug) {
-                BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: skipping voice frame (invalid callback args)";
-            }
+            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: skipping voice frame (invalid callback args)";
             return 0;
         }
 
         if (codec_type != 0 || param_count < 8) {
-            if (fne_config.debug) {
-                BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: skipping voice frame, codecType = " << codec_type
-                                         << ", paramCount = " << param_count;
-            }
+            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: skipping voice frame, codecType = " << codec_type
+                                     << ", paramCount = " << param_count;
             return 0;
         }
 
         System *system = call->get_system();
         if (!system) {
-            if (fne_config.debug) {
-                BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: skipping voice frame (missing system pointer)";
-            }
+            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: skipping voice frame (missing system pointer)";
             return 0;
         }
 
@@ -710,11 +719,9 @@ public:
         if (!route) {
             return 0;
         } else {
-            if (fne_config.debug) {
-                BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: valid route for, tgid = " << actual_tgid
-                                         << ", shortName = " << short_name
-                                         << ", encrypted = " << encrypted;
-            }
+            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: valid route for, tgid = " << actual_tgid
+                                     << ", shortName = " << short_name
+                                     << ", encrypted = " << encrypted;
         }
 
         const uint32_t dst_tgid = resolve_dst_tgid(route, actual_tgid);
@@ -729,25 +736,22 @@ public:
         }
 
         if (effective_src == 0U) {
-            if (fne_config.debug) {
-                BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: dropping voice frame with invalid source ID"
-                                         << ", callSrc = " << current_src
-                                         << ", cbSrc = " << src_id
-                                         << ", callTg = " << call_tgid
-                                         << ", cbTg = " << callback_tgid;
-            }
-            return 0;
+            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: dropping voice frame with invalid source ID"
+                                     << ", callSrc = " << current_src
+                                     << ", cbSrc = " << src_id
+                                     << ", callTg = " << call_tgid
+                                     << ", cbTg = " << callback_tgid;
+           return 0;
         }
 
         std::array<uint8_t, RAW_IMBE_LENGTH_BYTES> imbe{};
         if (!pack_imbe(params, param_count, imbe)) {
-            if (fne_config.debug) {
-                BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: failed IMBE pack for tgid=" << actual_tgid;
-            }
+            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: failed IMBE pack for tgid=" << actual_tgid;
             return 0;
         }
 
-        const std::string call_key = make_call_key(short_name, call->get_call_num());
+        const int sys_num = static_cast<int>(system->get_sys_id() & 0xFFFFU);
+        const std::string call_key = make_call_key(short_name, sys_num, call->get_call_num(), actual_tgid);
 
         P25CallState ready_state;
         bool emit_ldu = false;
@@ -763,8 +767,7 @@ public:
 
             const uint32_t normalized_src = effective_src & 0x00FFFFFFU;
             const uint32_t normalized_dst = dst_tgid & 0x00FFFFFFU;
-            if (fne_config.debug &&
-                (state.header.srcId != normalized_src || state.header.dstId != normalized_dst)) {
+            if (state.header.srcId != normalized_src || state.header.dstId != normalized_dst) {
                 BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: header normalization"
                                          << ", callKey = " << call_key
                                          << ", builtSrc = " << state.header.srcId
@@ -797,6 +800,12 @@ public:
         }
 
         if (queue_leading_silence) {
+            BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: call route"
+                                    << ", callKey = " << call_key
+                                    << ", srcTg = " << actual_tgid
+                                    << ", dstTg = " << dst_tgid
+                                    << ", sysId = " << sys_num
+                                    << ", shortName = " << short_name;
             queue_silence_ldu_pair(lane_key, call_key, leading_header, encrypted, false);
         }
 
@@ -806,7 +815,7 @@ public:
             frame.end_of_call = false;
             frame.payload = build_ldu_payload(ready_state, emit_ldu2);
 
-            if (fne_config.debug && frame.payload.size() >= MSG_HDR_SIZE &&
+            if (frame.payload.size() >= MSG_HDR_SIZE &&
                 std::memcmp(frame.payload.data(), TAG_P25_DATA, 4U) == 0) {
                 const uint32_t hdr_src = ((uint32_t)(frame.payload[5U]) << 16) |
                     ((uint32_t)(frame.payload[6U]) << 8) |
@@ -831,12 +840,10 @@ public:
 
             schedule_mux_frame(lane_key, call_key, std::move(frame));
 
-            if (fne_config.debug) {
-                BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: queued " << (emit_ldu2 ? "LDU2" : "LDU1")
-                                         << ", callKey = " << call_key
-                                         << ", srcTg = " << actual_tgid
-                                         << ", dstTg = " << dst_tgid;
-            }
+            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: queued " << (emit_ldu2 ? "LDU2" : "LDU1")
+                                     << ", callKey = " << call_key
+                                     << ", srcTg = " << actual_tgid
+                                     << ", dstTg = " << dst_tgid;
         }
 
         return 0;
@@ -1054,6 +1061,7 @@ private:
 
             next_it->second.active = true;
             next_it->second.queued = false;
+            next_it->second.last_activity = std::chrono::steady_clock::now();
             lane.active_call_key = next_call_key;
 
             flush_mux_buffered_frames_locked(next_call_key);
@@ -1109,6 +1117,10 @@ private:
             call_state.active = false;
         }
 
+        // Track queued-call freshness so stale promotion can recover if call_end
+        // arrives without additional voice callbacks for this call.
+        call_state.last_activity = now;
+
         buffer_mux_frame_locked(call_key, std::move(frame));
     }
 
@@ -1138,6 +1150,7 @@ private:
 
             const auto& last = call_it->second.last_activity;
             if (last.time_since_epoch().count() == 0) {
+                stale_lanes.emplace_back(lane_key, lane.active_call_key);
                 continue;
             }
 
@@ -1149,12 +1162,10 @@ private:
         }
 
         for (const auto& stale : stale_lanes) {
-            if (fne_config.debug) {
-                BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: promoting stale mux active call"
-                                         << ", lane = " << stale.first
-                                         << ", callKey = " << stale.second
-                                         << ", waiting = " << mux_lane_state[stale.first].waiting_calls.size();
-            }
+            BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: promoting stale mux active call"
+                                       << ", lane = " << stale.first
+                                       << ", callKey = " << stale.second
+                                       << ", waiting = " << mux_lane_state[stale.first].waiting_calls.size();
             complete_lane_and_promote_locked(stale.first, stale.second);
         }
     }
@@ -1172,6 +1183,7 @@ private:
         }
 
         call_it->second.ended = true;
+        call_it->second.last_activity = std::chrono::steady_clock::now();
 
         if (call_it->second.active) {
             complete_lane_and_promote_locked(lane_key, call_key);
@@ -1676,7 +1688,7 @@ private:
                                 const uint64_t elapsed_ms = (uint64_t)(std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count());
                                 if (elapsed_ms >= (uint64_t)(fne_config.pacedCallTimeoutMs)) {
                                     paced_timeout_drops++;
-                                    if (fne_config.debug || (paced_timeout_drops % 100U) == 0U) {
+                                    if ((paced_timeout_drops % 100U) == 0U) {
                                         BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: dropping paced call frame after timeout"
                                                                    << ", callKey = " << frame.call_key
                                                                    << ", elapsedMs = " << elapsed_ms
@@ -1867,9 +1879,7 @@ private:
         send_enveloped(payload, NET_FUNC::RPTL, NET_SUBFUNC::NOP, next_seq(false), login_stream_id);
 
         net_state = NET_STAT_WAITING_LOGIN;
-        if (fne_config.debug) {
-            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: sent login";
-        }
+        BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: sent login";
     }
 
     /**
@@ -1890,9 +1900,7 @@ private:
         std::memcpy(payload.data() + 8U, digest, SHA256_DIGEST_LENGTH);
 
         send_enveloped(payload, NET_FUNC::RPTK, NET_SUBFUNC::NOP, next_seq(false), login_stream_id);
-        if (fne_config.debug) {
-            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: sent auth";
-        }
+        BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: sent auth";
     }
 
     /**
@@ -1934,9 +1942,7 @@ private:
         std::memcpy(payload.data() + 8U, cfg_json.data(), cfg_json.size());
 
         send_enveloped(payload, NET_FUNC::RPTC, NET_SUBFUNC::NOP, RTP_END_OF_CALL_SEQ, login_stream_id);
-        if (fne_config.debug) {
-            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: sent config";
-        }
+        BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: sent config";
     }
 
     /**
@@ -2003,7 +2009,7 @@ private:
 
         const uint16_t seq = next_seq(frame.end_of_call);
 
-        if (fne_config.debug && frame.payload.size() >= MSG_HDR_SIZE &&
+        if (frame.payload.size() >= MSG_HDR_SIZE &&
             std::memcmp(frame.payload.data(), TAG_P25_DATA, 4U) == 0) {
             uint32_t srcId = GET_UINT24(frame.payload.data(), 5U);
             uint32_t dstId = GET_UINT24(frame.payload.data(), 8U);
@@ -2085,7 +2091,7 @@ private:
             return;
         }
 
-        if (fne_config.debug && func == NET_FUNC::PROTOCOL) {
+        if (func == NET_FUNC::PROTOCOL) {
             if (payload.size() >= MSG_HDR_SIZE && std::memcmp(payload.data(), TAG_P25_DATA, 4U) == 0) {
                 uint32_t srcId = GET_UINT24(payload.data(), 5U);
                 uint32_t dstId = GET_UINT24(payload.data(), 8U);

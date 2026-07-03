@@ -39,8 +39,7 @@ For more information, see https://github.com/TrunkRecorder/trunk-recorder/blob/m
     "identity": "trunk-recorder",
     "maxMissedPings": 10,
     "retryIntervalMs": 3000,
-    "pacedCallTimeoutMs": 10000,
-    "debug": false
+    "pacedCallTimeoutMs": 10000
   },
   "maxQueueDepth": 8192,
   "routes": [
