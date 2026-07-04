@@ -128,6 +128,9 @@ const uint8_t   MFG_STANDARD = 0x00U;
 /** @brief Unencrypted */
 const uint8_t   ALGO_UNENCRYPT = 0x80U;
 
+/** @brief FNE Working Unit ID */
+const uint32_t  WUID_FNE = 0xFFFFFCU;
+
 const uint8_t   P25_LCO_GROUP = 0x00U;          //!< GRP VCH USER - Group Voice Channel User
 
 const uint32_t  MI_LENGTH_BYTES = 9U;
@@ -394,7 +397,7 @@ struct FneConfig {
 struct P25MessageHdr {
     uint8_t lco = P25_LCO_GROUP;
 
-    uint32_t srcId = 0U;
+    uint32_t srcId = WUID_FNE;
     uint32_t dstId = 0U;
 
     uint16_t sysId = 0U;
@@ -450,7 +453,7 @@ struct FrameLogInfo {
     std::string call_key;
     std::string lane_key;
     uint32_t dst_tgid = 0U;
-    uint32_t src_id = 0U;
+    uint32_t src_id = WUID_FNE;
     uint32_t hdr_dst_id = 0U;
     uint8_t duid = 0U;
     uint8_t frame_len = 0U;
@@ -760,7 +763,7 @@ public:
             header = state.header;
         } else {
             header.lco = P25_LCO_GROUP;
-            header.srcId = (call_info.source_num > 0) ? ((uint32_t)(call_info.source_num) & 0x00FFFFFFU) : 0U;
+            header.srcId = (call_info.source_num > 0) ? ((uint32_t)(call_info.source_num) & 0x00FFFFFFU) : WUID_FNE;
             header.dstId = dst_tgid;
             header.sysId = static_cast<uint16_t>(call_info.sys_num & 0xFFFFU);
             header.serviceOptions = call_info.encrypted ? 0x40U : 0x00U;
@@ -869,6 +872,8 @@ public:
         }
 
         if (effective_src == 0U) {
+            effective_src = WUID_FNE;
+/*
             const std::string invalid_call_key = make_call_key(short_name, call->get_call_num());
             if (note_invalid_source_drop(invalid_call_key)) {
                 BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: dropping voice frame with invalid source ID"
@@ -888,6 +893,7 @@ public:
                                          << ", cbTg = " << callback_tgid;
             }
            return 0;
+*/
         }
 
         std::array<uint8_t, RAW_IMBE_LENGTH_BYTES> imbe{};
