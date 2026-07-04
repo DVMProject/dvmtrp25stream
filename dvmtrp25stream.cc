@@ -297,13 +297,26 @@ uint16_t CRC16_CCITT(const uint8_t *data, size_t len)
 }
 
 /**
- * @brief Generates a stable call key for cross-callback correlation.
+ * @brief Generates a unique call key based on the short name and call number.
+ * @param short_name System short name.
+ * @param call_num Trunk-recorder call number.
+ * @returns std::string Stable key in the format "short_name:call_num".
+ */
+std::string make_call_key(const std::string& short_name, long call_num)
+{
+    std::ostringstream oss;
+    oss << short_name << ":" << call_num;
+    return oss.str();
+}
+
+/**
+ * @brief Generates a TGID fallback key for cross-callback correlation.
  * @param short_name System short name.
  * @param source_tgid Source talkgroup ID from trunk-recorder.
  * @param dst_tgid Destination talkgroup ID after route translation.
- * @returns std::string Stable key in the format "short_name:source_tgid:dst_tgid".
+ * @returns std::string Fallback key in the format "short_name:source_tgid:dst_tgid".
  */
-std::string make_call_key(const std::string& short_name, long source_tgid, uint32_t dst_tgid)
+std::string make_tgid_call_key(const std::string& short_name, long source_tgid, uint32_t dst_tgid)
 {
     std::ostringstream oss;
     const long normalized_source_tgid = (source_tgid < 0) ? 0 : source_tgid;
@@ -430,6 +443,41 @@ struct OutboundFrame {
 };
 
 /**
+ * @brief Represents a compact summary of an outbound frame for diagnostics.
+ */
+
+struct FrameLogInfo {
+    std::string call_key;
+    std::string lane_key;
+    uint32_t dst_tgid = 0U;
+    uint32_t src_id = 0U;
+    uint32_t hdr_dst_id = 0U;
+    uint8_t duid = 0U;
+    uint8_t frame_len = 0U;
+    size_t payload_size = 0U;
+    bool end_of_call = false;
+    bool valid_p25 = false;
+};
+
+/**
+ * @brief Represents low-noise diagnostics for a single outbound call.
+ */
+
+struct CallDiagnosticState {
+    bool first_queue_logged = false;
+    bool first_dispatch_logged = false;
+    bool first_send_logged = false;
+    bool tdu_queue_logged = false;
+    bool tdu_dispatch_logged = false;
+    bool tdu_send_logged = false;
+    bool first_drop_logged = false;
+    uint64_t queued_frames = 0U;
+    uint64_t dispatched_frames = 0U;
+    uint64_t send_attempts = 0U;
+    uint64_t dropped_frames = 0U;
+};
+
+/**
  * @brief Represents the state of a stream.
  */
 
@@ -456,13 +504,16 @@ struct MuxLaneState {
 
 struct CallMuxState {
     std::string lane_key;
+    std::string tgid_call_key;
     bool active = false;
     bool queued = false;
     bool ended = false;
     bool synthetic_end_queued = false;
+    bool buffered_log_sent = false;
     bool header_valid = false;
     bool encrypted = false;
     bool next_is_ldu2 = false;
+    uint64_t buffered_frames = 0U;
     long source_tgid = 0;
     P25MessageHdr header;
     std::chrono::steady_clock::time_point last_activity{};
@@ -577,7 +628,7 @@ public:
 
             running.store(true);
             start_sender_workers();
-            net_state = NET_STAT_WAITING_CONNECT;
+            set_net_state(NET_STAT_WAITING_CONNECT, "start");
             next_retry_at = std::chrono::steady_clock::now();
             worker = std::thread(&DVMTRP25Stream::worker_loop, this);
 
@@ -627,13 +678,13 @@ public:
     int call_end(Call_Data_t call_info) override {
         const Route *route = find_route(call_info.talkgroup, call_info.short_name, call_info.encrypted);
         uint32_t dst_tgid = resolve_dst_tgid(route, call_info.talkgroup);
-        std::string call_key = make_call_key(call_info.short_name, call_info.talkgroup, dst_tgid);
+        std::string call_key = make_call_key(call_info.short_name, call_info.call_num);
+        const std::string tgid_call_key = make_tgid_call_key(call_info.short_name, call_info.talkgroup, dst_tgid);
 
         P25CallState state;
         bool have_state = false;
 
-        // scope is intentional
-        {
+        const auto load_p25_state = [&]() {
             std::lock_guard<std::mutex> lock(p25_state_mutex);
             auto it = p25_call_state.find(call_key);
             if (it != p25_call_state.end()) {
@@ -641,26 +692,47 @@ public:
                 p25_call_state.erase(it);
                 have_state = true;
             }
-        }
+        };
+
+        load_p25_state();
 
         const std::string fallback_lane_key = make_mux_lane_key(make_route_lane_key(route), call_info.short_name, dst_tgid);
-        const bool have_mux_state = has_mux_call_state(call_key);
+        bool have_mux_state = has_mux_call_state(call_key);
+        if (!have_state && !have_mux_state && call_info.call_num <= 0) {
+            const std::string tracked_call_key = resolve_tracked_call_key_for_tgid(tgid_call_key);
+            if (!tracked_call_key.empty() && tracked_call_key != call_key) {
+                const std::string original_call_key = call_key;
+                call_key = tracked_call_key;
+                call_end_fallback_matches++;
+                BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: call_end matched tracked TGID fallback"
+                                           << ", callKey = " << tracked_call_key
+                                           << ", originalCallKey = " << original_call_key
+                                           << ", tgidKey = " << tgid_call_key
+                                           << ", callNum = " << call_info.call_num
+                                           << ", fallbackMatches = " << call_end_fallback_matches;
+                load_p25_state();
+                have_mux_state = has_mux_call_state(call_key);
+            }
+        }
+
         const std::string lane_key = resolve_lane_key_for_call(call_key, fallback_lane_key);
-        bool forced_end_injection = false;
 
         // Guard against false call_end callbacks (for non-P25 or otherwise
         // unrouted calls): do not synthesize end frames unless this call had
         // real voice/mux state in this plugin.
         if (!have_state && !have_mux_state) {
             if (route != nullptr) {
-                BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: call_end route matched but no voice/mux state, forcing fallback end injection"
+                BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: call_end route matched but no voice/mux state, skipping fallback end injection"
                                            << ", callKey = " << call_key
+                                           << ", callNum = " << call_info.call_num
                                            << ", tgid = " << call_info.talkgroup
+                                           << ", sourceId = " << call_info.source_num
                                            << ", sysId = " << call_info.sys_num
                                            << ", shortName = " << call_info.short_name;
-                forced_end_injection = true;
+                return 0;
             } else {
                 BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: call_end no route/state, callKey = " << call_key
+                                           << ", callNum = " << call_info.call_num
                                            << ", tgid = " << call_info.talkgroup
                                            << ", sysId = " << call_info.sys_num
                                            << ", shortName = " << call_info.short_name;
@@ -668,6 +740,7 @@ public:
             }
         }
 
+        const uint8_t partial_imbe_count = have_state ? state.imbeCount : 0U;
         if (have_state && state.imbeCount > 0U) {
             const uint8_t *null_frame = call_info.encrypted ? ENCRYPTED_NULL_IMBE : NULL_IMBE;
             while (state.imbeCount < 9U) {
@@ -709,13 +782,16 @@ public:
         schedule_mux_frame(lane_key, call_key, std::move(frame));
         mark_mux_call_ended(call_key, lane_key);
 
-        BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: queued TDU, callKey = " << call_key
-                                 << ", dstTg = " << header.dstId;
-        if (forced_end_injection) {
-            BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: fallback call_end injected without prior voice state"
-                                       << ", callKey = " << call_key
-                                       << ", dstTg = " << header.dstId;
-        }
+        BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: call_end queued TDU"
+                                << ", callKey = " << call_key
+                                << ", callNum = " << call_info.call_num
+                                << ", srcTg = " << call_info.talkgroup
+                                << ", dstTg = " << header.dstId
+                                << ", srcId = " << header.srcId
+                                << ", haveVoiceState = " << have_state
+                                << ", haveMuxState = " << have_mux_state
+                                << ", partialImbe = " << (uint32_t)(partial_imbe_count)
+                                << ", lane = " << lane_key;
         return 0;
     }
 
@@ -731,7 +807,6 @@ public:
      * @returns int 0 on success, non-zero on failure.
      */
     int voice_codec_data(Call* call, int codec_type, long tgid, uint32_t src_id, const uint32_t* params, int param_count, int errs) override {
-        (void)errs;
         if (!call || !params || param_count <= 0) {
             BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: skipping voice frame (invalid callback args)";
             return 0;
@@ -794,11 +869,24 @@ public:
         }
 
         if (effective_src == 0U) {
-            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: dropping voice frame with invalid source ID"
-                                     << ", callSrc = " << current_src
-                                     << ", cbSrc = " << src_id
-                                     << ", callTg = " << call_tgid
-                                     << ", cbTg = " << callback_tgid;
+            const std::string invalid_call_key = make_call_key(short_name, call->get_call_num());
+            if (note_invalid_source_drop(invalid_call_key)) {
+                BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: dropping voice frame with invalid source ID"
+                                           << ", callKey = " << invalid_call_key
+                                           << ", callNum = " << call->get_call_num()
+                                           << ", callSrc = " << current_src
+                                           << ", cbSrc = " << src_id
+                                           << ", callTg = " << call_tgid
+                                           << ", cbTg = " << callback_tgid
+                                           << ", shortName = " << short_name;
+            } else {
+                BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: dropping voice frame with invalid source ID"
+                                         << ", callKey = " << invalid_call_key
+                                         << ", callSrc = " << current_src
+                                         << ", cbSrc = " << src_id
+                                         << ", callTg = " << call_tgid
+                                         << ", cbTg = " << callback_tgid;
+            }
            return 0;
         }
 
@@ -809,9 +897,8 @@ public:
         }
 
         const int sys_num = static_cast<int>(system->get_sys_id() & 0xFFFFU);
-        const std::string call_key = make_call_key(short_name, actual_tgid, dst_tgid);
-
-        supersede_calls_for_source_tgid(lane_key, actual_tgid, call_key);
+        const std::string call_key = make_call_key(short_name, call->get_call_num());
+        const std::string tgid_call_key = make_tgid_call_key(short_name, actual_tgid, dst_tgid);
 
         P25CallState ready_state;
         bool emit_ldu = false;
@@ -863,17 +950,23 @@ public:
             }
         }
 
-        update_call_mux_state_from_voice(call_key, lane_key, actual_tgid, current_header, encrypted, current_next_is_ldu2);
+        update_call_mux_state_from_voice(call_key, tgid_call_key, lane_key, actual_tgid, current_header, encrypted, current_next_is_ldu2);
 
         if (queue_leading_silence) {
             BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: call route"
                                     << ", callKey = " << call_key
+                                    << ", callNum = " << call->get_call_num()
                                     << ", srcTg = " << actual_tgid
                                     << ", dstTg = " << dst_tgid
+                                    << ", srcId = " << effective_src
+                                    << ", callSrc = " << current_src
+                                    << ", cbSrc = " << src_id
                                     << ", sysId = " << sys_num
-                                    << ", shortName = " << short_name;
+                                    << ", shortName = " << short_name
+                                    << ", lane = " << lane_key
+                                    << ", errs = " << errs;
 
-            update_call_mux_state_from_voice(call_key, lane_key, actual_tgid, leading_header, encrypted, false);
+            update_call_mux_state_from_voice(call_key, tgid_call_key, lane_key, actual_tgid, leading_header, encrypted, false);
             queue_silence_ldu_pair(lane_key, call_key, leading_header, encrypted, false);
         }
 
@@ -908,10 +1001,11 @@ public:
 
             schedule_mux_frame(lane_key, call_key, std::move(frame));
 
-            update_call_mux_state_from_voice(call_key, lane_key, actual_tgid, ready_state.header, encrypted, emit_ldu2 ? false : true);
+            update_call_mux_state_from_voice(call_key, tgid_call_key, lane_key, actual_tgid, ready_state.header, encrypted, emit_ldu2 ? false : true);
 
             BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: queued " << (emit_ldu2 ? "LDU2" : "LDU1")
                                      << ", callKey = " << call_key
+                                     << ", callNum = " << call->get_call_num()
                                      << ", srcTg = " << actual_tgid
                                      << ", dstTg = " << dst_tgid;
         }
@@ -920,6 +1014,474 @@ public:
     }
 
 private:
+    /**
+     * @brief Converts a network state to a short diagnostic name.
+     * @param state Network connection state.
+     * @returns const char* Human-readable network state name.
+     */
+    static const char* net_state_name(NET_CONN_STATUS state) {
+        switch (state) {
+            case NET_STAT_WAITING_CONNECT:
+                return "WAITING_CONNECT";
+            case NET_STAT_WAITING_LOGIN:
+                return "WAITING_LOGIN";
+            case NET_STAT_WAITING_AUTHORISATION:
+                return "WAITING_AUTHORISATION";
+            case NET_STAT_WAITING_CONFIG:
+                return "WAITING_CONFIG";
+            case NET_STAT_RUNNING:
+                return "RUNNING";
+            default:
+                return "INVALID";
+        }
+    }
+
+    /**
+     * @brief Converts a DUID value to a short diagnostic name.
+     * @param duid DUID value.
+     * @returns const char* Human-readable DUID name.
+     */
+    static const char* duid_name(uint8_t duid) {
+        switch (duid) {
+            case DUID::TDU:
+                return "TDU";
+            case DUID::LDU1:
+                return "LDU1";
+            case DUID::LDU2:
+                return "LDU2";
+            default:
+                return "UNKNOWN";
+        }
+    }
+
+    /**
+     * @brief Builds compact diagnostic metadata from an outbound frame.
+     * @param frame Outbound frame to inspect.
+     * @returns FrameLogInfo Summary of the outbound frame.
+     */
+    FrameLogInfo make_frame_log_info(const OutboundFrame& frame) const {
+        FrameLogInfo frame_info;
+        frame_info.call_key = frame.call_key;
+        frame_info.lane_key = frame.lane_key;
+        frame_info.dst_tgid = frame.dst_tgid;
+        frame_info.payload_size = frame.payload.size();
+        frame_info.end_of_call = frame.end_of_call;
+
+        if (frame.payload.size() >= MSG_HDR_SIZE &&
+            std::memcmp(frame.payload.data(), TAG_P25_DATA, 4U) == 0) {
+            frame_info.valid_p25 = true;
+            frame_info.src_id = GET_UINT24(frame.payload.data(), 5U);
+            frame_info.hdr_dst_id = GET_UINT24(frame.payload.data(), 8U);
+            frame_info.duid = frame.payload[22U];
+            frame_info.frame_len = frame.payload[23U];
+        }
+
+        return frame_info;
+    }
+
+    /**
+     * @brief Records a frame entering the outbound queue.
+     * @param frame_info Frame diagnostics.
+     */
+    void note_outbound_queued(const FrameLogInfo& frame_info) {
+        if (frame_info.call_key.empty()) {
+            return;
+        }
+
+        bool log_first_queue = false;
+        bool log_tdu_queue = false;
+        uint64_t queued_frames = 0U;
+
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> lock(call_diagnostic_mutex);
+            CallDiagnosticState& state = call_diagnostic_state[frame_info.call_key];
+            state.queued_frames++;
+            queued_frames = state.queued_frames;
+
+            if (!state.first_queue_logged) {
+                state.first_queue_logged = true;
+                log_first_queue = true;
+            }
+
+            if (frame_info.end_of_call && !state.tdu_queue_logged) {
+                state.tdu_queue_logged = true;
+                log_tdu_queue = true;
+            }
+        }
+
+        if (log_first_queue) {
+            BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: outbound queue started"
+                                    << ", callKey = " << frame_info.call_key
+                                    << ", lane = " << frame_info.lane_key
+                                    << ", srcId = " << frame_info.src_id
+                                    << ", dstTg = " << frame_info.dst_tgid
+                                    << ", hdrDst = " << frame_info.hdr_dst_id
+                                    << ", duid = " << (uint32_t)(frame_info.duid)
+                                    << ", duidName = " << duid_name(frame_info.duid)
+                                    << ", frameLen = " << (uint32_t)(frame_info.frame_len)
+                                    << ", payloadBytes = " << frame_info.payload_size;
+        }
+
+        if (log_tdu_queue) {
+            BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: outbound TDU queued"
+                                    << ", callKey = " << frame_info.call_key
+                                    << ", lane = " << frame_info.lane_key
+                                    << ", srcId = " << frame_info.src_id
+                                    << ", dstTg = " << frame_info.dst_tgid
+                                    << ", queuedFrames = " << queued_frames;
+        }
+    }
+
+    /**
+     * @brief Records a frame entering a sender worker queue.
+     * @param frame_info Frame diagnostics.
+     * @param worker_index Sender worker index.
+     * @param worker_depth Sender worker queue depth after enqueue.
+     */
+    void note_sender_dispatched(const FrameLogInfo& frame_info, size_t worker_index, size_t worker_depth) {
+        if (frame_info.call_key.empty()) {
+            return;
+        }
+
+        bool log_first_dispatch = false;
+        bool log_tdu_dispatch = false;
+        uint64_t dispatched_frames = 0U;
+
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> lock(call_diagnostic_mutex);
+            CallDiagnosticState& state = call_diagnostic_state[frame_info.call_key];
+            state.dispatched_frames++;
+            dispatched_frames = state.dispatched_frames;
+
+            if (!state.first_dispatch_logged) {
+                state.first_dispatch_logged = true;
+                log_first_dispatch = true;
+            }
+
+            if (frame_info.end_of_call && !state.tdu_dispatch_logged) {
+                state.tdu_dispatch_logged = true;
+                log_tdu_dispatch = true;
+            }
+        }
+
+        if (log_first_dispatch) {
+            BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: sender dispatch started"
+                                    << ", callKey = " << frame_info.call_key
+                                    << ", workerIndex = " << worker_index
+                                    << ", workerDepth = " << worker_depth
+                                    << ", srcId = " << frame_info.src_id
+                                    << ", dstTg = " << frame_info.dst_tgid
+                                    << ", duid = " << (uint32_t)(frame_info.duid)
+                                    << ", duidName = " << duid_name(frame_info.duid);
+        }
+
+        if (log_tdu_dispatch) {
+            BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: sender dispatch TDU"
+                                    << ", callKey = " << frame_info.call_key
+                                    << ", workerIndex = " << worker_index
+                                    << ", workerDepth = " << worker_depth
+                                    << ", dispatchedFrames = " << dispatched_frames
+                                    << ", dstTg = " << frame_info.dst_tgid;
+        }
+    }
+
+    /**
+     * @brief Records a protocol send attempt.
+     * @param frame_info Frame diagnostics.
+     * @param stream_id FNE stream ID used for the packet.
+     * @param seq RTP sequence number.
+     * @param timestamp RTP timestamp.
+     */
+    void note_protocol_send_attempt(const FrameLogInfo& frame_info, uint32_t stream_id, uint16_t seq, uint32_t timestamp) {
+        if (frame_info.call_key.empty()) {
+            return;
+        }
+
+        bool log_first_send = false;
+        bool log_tdu_send = false;
+        uint64_t queued_frames = 0U;
+        uint64_t dispatched_frames = 0U;
+        uint64_t send_attempts = 0U;
+        uint64_t dropped_frames = 0U;
+
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> lock(call_diagnostic_mutex);
+            CallDiagnosticState& state = call_diagnostic_state[frame_info.call_key];
+            state.send_attempts++;
+            queued_frames = state.queued_frames;
+            dispatched_frames = state.dispatched_frames;
+            send_attempts = state.send_attempts;
+            dropped_frames = state.dropped_frames;
+
+            if (!state.first_send_logged) {
+                state.first_send_logged = true;
+                log_first_send = true;
+            }
+
+            if (frame_info.end_of_call && !state.tdu_send_logged) {
+                state.tdu_send_logged = true;
+                log_tdu_send = true;
+            }
+        }
+
+        if (log_first_send) {
+            BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: protocol send started"
+                                    << ", callKey = " << frame_info.call_key
+                                    << ", streamId = " << stream_id
+                                    << ", seq = " << seq
+                                    << ", timestamp = " << timestamp
+                                    << ", srcId = " << frame_info.src_id
+                                    << ", dstTg = " << frame_info.dst_tgid
+                                    << ", hdrDst = " << frame_info.hdr_dst_id
+                                    << ", duid = " << (uint32_t)(frame_info.duid)
+                                    << ", duidName = " << duid_name(frame_info.duid)
+                                    << ", frameLen = " << (uint32_t)(frame_info.frame_len);
+        }
+
+        if (log_tdu_send) {
+            BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: protocol TDU send attempted"
+                                    << ", callKey = " << frame_info.call_key
+                                    << ", streamId = " << stream_id
+                                    << ", seq = " << seq
+                                    << ", timestamp = " << timestamp
+                                    << ", srcId = " << frame_info.src_id
+                                    << ", dstTg = " << frame_info.dst_tgid
+                                    << ", queuedFrames = " << queued_frames
+                                    << ", dispatchedFrames = " << dispatched_frames
+                                    << ", sendAttempts = " << send_attempts
+                                    << ", droppedFrames = " << dropped_frames;
+        }
+    }
+
+    /**
+     * @brief Records a dropped frame without logging every repeated drop.
+     * @param frame_info Frame diagnostics.
+     * @param reason Drop reason.
+     */
+    void note_frame_dropped(const FrameLogInfo& frame_info, const char* reason) {
+        if (frame_info.call_key.empty()) {
+            return;
+        }
+
+        bool log_drop = false;
+        uint64_t dropped_frames = 0U;
+
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> lock(call_diagnostic_mutex);
+            CallDiagnosticState& state = call_diagnostic_state[frame_info.call_key];
+            state.dropped_frames++;
+            dropped_frames = state.dropped_frames;
+
+            if (!state.first_drop_logged || frame_info.end_of_call) {
+                state.first_drop_logged = true;
+                log_drop = true;
+            }
+        }
+
+        if (log_drop) {
+            BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: dropped outbound frame"
+                                       << ", reason = " << reason
+                                       << ", callKey = " << frame_info.call_key
+                                       << ", lane = " << frame_info.lane_key
+                                       << ", srcId = " << frame_info.src_id
+                                       << ", dstTg = " << frame_info.dst_tgid
+                                       << ", duid = " << (uint32_t)(frame_info.duid)
+                                       << ", duidName = " << duid_name(frame_info.duid)
+                                       << ", callDroppedFrames = " << dropped_frames;
+        }
+    }
+
+    /**
+     * @brief Determines if an invalid source drop should be logged at warning level.
+     * @param call_key Per-call key.
+     * @returns bool True when this is the first invalid source drop for the call.
+     */
+    bool note_invalid_source_drop(const std::string& call_key) {
+        std::lock_guard<std::mutex> lock(call_diagnostic_mutex);
+        return invalid_source_drop_keys.insert(call_key).second;
+    }
+
+    /**
+     * @brief Clears per-call diagnostic state after a completed TDU path.
+     * @param call_key Per-call key.
+     */
+    void clear_call_diagnostics(const std::string& call_key) {
+        if (call_key.empty()) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(call_diagnostic_mutex);
+        call_diagnostic_state.erase(call_key);
+        invalid_source_drop_keys.erase(call_key);
+    }
+
+    /**
+     * @brief Generates a per-owner blocking key for destination TGID diagnostics.
+     * @param dst_tgid Destination TGID.
+     * @param owner_call_key Current owner call key.
+     * @param waiting_call_key Waiting call key.
+     * @returns std::string Blocking diagnostic key.
+     */
+    std::string make_dst_tgid_block_key(uint32_t dst_tgid, const std::string& owner_call_key, const std::string& waiting_call_key) const {
+        std::ostringstream oss;
+        oss << dst_tgid << ":" << owner_call_key << ":" << waiting_call_key;
+        return oss.str();
+    }
+
+    /**
+     * @brief Returns the number of frames currently waiting in the outbound queue.
+     * @returns size_t Outbound queue size.
+     */
+    size_t queued_frame_count() {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        return queue_size;
+    }
+
+    /**
+     * @brief Logs a network state transition with current queue pressure.
+     * @param new_state New network state.
+     * @param reason Transition reason.
+     */
+    void set_net_state(NET_CONN_STATUS new_state, const char* reason) {
+        const NET_CONN_STATUS old_state = net_state;
+        net_state = new_state;
+
+        if (old_state != new_state) {
+            BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: FNE state changed"
+                                    << ", from = " << net_state_name(old_state)
+                                    << ", to = " << net_state_name(new_state)
+                                    << ", reason = " << reason
+                                    << ", queuedFrames = " << queued_frame_count();
+        }
+    }
+
+    /**
+     * @brief Logs when outbound frames are waiting while the FNE session is not running.
+     * @param now Current time point.
+     */
+    void log_queue_waiting_for_session(const std::chrono::steady_clock::time_point& now) {
+        size_t queued_frames = 0U;
+        size_t queued_lanes = 0U;
+        size_t dst_owners = 0U;
+        std::string front_lane;
+        std::string front_call_key;
+        uint32_t front_dst_tgid = 0U;
+
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            queued_frames = queue_size;
+            queued_lanes = lane_queues.size();
+            dst_owners = dst_tgid_active_calls.size();
+
+            if (!lane_rr.empty()) {
+                front_lane = lane_rr.front();
+                auto it = lane_queues.find(front_lane);
+                if (it != lane_queues.end() && !it->second.empty()) {
+                    front_call_key = it->second.front().call_key;
+                    front_dst_tgid = it->second.front().dst_tgid;
+                }
+            }
+        }
+
+        if (queued_frames == 0U) {
+            return;
+        }
+
+        const bool state_changed = (last_queue_wait_state != net_state);
+        const bool size_changed = (last_queue_wait_size != queued_frames);
+        if (!state_changed && !size_changed && now < next_queue_wait_log_at) {
+            return;
+        }
+
+        int64_t next_retry_ms = -1;
+        if (next_retry_at.time_since_epoch().count() != 0) {
+            next_retry_ms = std::chrono::duration_cast<std::chrono::milliseconds>(next_retry_at - now).count();
+            if (next_retry_ms < 0) {
+                next_retry_ms = 0;
+            }
+        }
+
+        queue_wait_logs++;
+        BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: outbound queue waiting for FNE session"
+                                   << ", state = " << net_state_name(net_state)
+                                   << ", queuedFrames = " << queued_frames
+                                   << ", lanes = " << queued_lanes
+                                   << ", dstOwners = " << dst_owners
+                                   << ", frontLane = " << front_lane
+                                   << ", frontCallKey = " << front_call_key
+                                   << ", frontDstTg = " << front_dst_tgid
+                                   << ", nextRetryMs = " << next_retry_ms
+                                   << ", awaitingPong = " << awaiting_pong
+                                   << ", missedPongs = " << missed_ping_count
+                                   << ", waitLogs = " << queue_wait_logs;
+
+        last_queue_wait_state = net_state;
+        last_queue_wait_size = queued_frames;
+        next_queue_wait_log_at = now + std::chrono::milliseconds(2000);
+    }
+
+    /**
+     * @brief Logs when the FNE session is running but queued frames did not dispatch.
+     * @param now Current time point.
+     */
+    void log_running_queue_stall(const std::chrono::steady_clock::time_point& now) {
+        size_t queued_frames = 0U;
+        size_t queued_lanes = 0U;
+        size_t dst_owners = 0U;
+        std::string front_lane;
+        std::string front_call_key;
+        uint32_t front_dst_tgid = 0U;
+        bool front_end_of_call = false;
+
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            queued_frames = queue_size;
+            queued_lanes = lane_queues.size();
+            dst_owners = dst_tgid_active_calls.size();
+
+            if (!lane_rr.empty()) {
+                front_lane = lane_rr.front();
+                auto it = lane_queues.find(front_lane);
+                if (it != lane_queues.end() && !it->second.empty()) {
+                    front_call_key = it->second.front().call_key;
+                    front_dst_tgid = it->second.front().dst_tgid;
+                    front_end_of_call = it->second.front().end_of_call;
+                }
+            }
+        }
+
+        if (queued_frames == 0U) {
+            return;
+        }
+
+        if (!front_call_key.empty() && !front_end_of_call && !is_non_end_frame_ready(front_call_key, now)) {
+            return;
+        }
+
+        if (now < next_running_queue_stall_log_at) {
+            return;
+        }
+
+        running_queue_stall_logs++;
+        BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: outbound queue did not dispatch while FNE session is running"
+                                   << ", queuedFrames = " << queued_frames
+                                   << ", lanes = " << queued_lanes
+                                   << ", dstOwners = " << dst_owners
+                                   << ", frontLane = " << front_lane
+                                   << ", frontCallKey = " << front_call_key
+                                   << ", frontDstTg = " << front_dst_tgid
+                                   << ", frontEndOfCall = " << front_end_of_call
+                                   << ", stallLogs = " << running_queue_stall_logs;
+
+        next_running_queue_stall_log_at = now + std::chrono::milliseconds(2000);
+    }
+
     /**
      * @brief Packs OP25 IMBE params (u0..u7) into an 11-byte packed codeword.
      * @param params Pointer to the IMBE parameters.
@@ -1029,19 +1591,21 @@ private:
     /**
      * @brief Updates the call mux state based on voice frame information.
      * @param call_key The call key for the state to update.
+     * @param tgid_call_key TGID fallback key for call_end correlation.
      * @param lane_key The lane key for the state to update.
      * @param source_tgid The source talkgroup ID.
      * @param header The message header to apply.
      * @param encrypted Whether the call is encrypted.
      * @param next_is_ldu2 Whether the next frame is an LDU2.
      */
-    void update_call_mux_state_from_voice(const std::string& call_key, const std::string& lane_key,
+    void update_call_mux_state_from_voice(const std::string& call_key, const std::string& tgid_call_key, const std::string& lane_key,
         long source_tgid, const P25MessageHdr& header, bool encrypted, bool next_is_ldu2) {
         std::lock_guard<std::mutex> lock(mux_mutex);
         const auto now = std::chrono::steady_clock::now();
 
         CallMuxState& state = call_mux_state[call_key];
         state.lane_key = lane_key;
+        state.tgid_call_key = tgid_call_key;
         state.source_tgid = source_tgid;
         state.header = header;
         state.header_valid = true;
@@ -1051,6 +1615,10 @@ private:
         state.synthetic_end_queued = false;
         if (!state.ended) {
             state.active = (mux_lane_state[lane_key].active_call_key == call_key);
+        }
+
+        if (!tgid_call_key.empty()) {
+            tgid_call_key_to_call_key[tgid_call_key] = call_key;
         }
     }
 
@@ -1063,6 +1631,50 @@ private:
         lane.waiting_calls.erase(
             std::remove(lane.waiting_calls.begin(), lane.waiting_calls.end(), call_key),
             lane.waiting_calls.end());
+    }
+
+    /**
+     * @brief Resolves a tracked call key from a TGID fallback key.
+     * @param tgid_call_key TGID fallback key.
+     * @returns std::string Tracked call key, or empty when unavailable.
+     */
+    std::string resolve_tracked_call_key_for_tgid(const std::string& tgid_call_key) {
+        std::lock_guard<std::mutex> lock(mux_mutex);
+        auto it = tgid_call_key_to_call_key.find(tgid_call_key);
+        if (it == tgid_call_key_to_call_key.end()) {
+            return "";
+        }
+        return it->second;
+    }
+
+    /**
+     * @brief Erases a TGID fallback alias when it still points at the same call.
+     * @param tgid_call_key TGID fallback key.
+     * @param call_key Per-call key.
+     */
+    void erase_tgid_call_key_locked(const std::string& tgid_call_key, const std::string& call_key) {
+        if (tgid_call_key.empty()) {
+            return;
+        }
+
+        auto it = tgid_call_key_to_call_key.find(tgid_call_key);
+        if (it != tgid_call_key_to_call_key.end() && it->second == call_key) {
+            tgid_call_key_to_call_key.erase(it);
+        }
+    }
+
+    /**
+     * @brief Erases mux state and the associated TGID fallback alias.
+     * @param call_key Per-call key.
+     */
+    void erase_call_mux_state_locked(const std::string& call_key) {
+        auto it = call_mux_state.find(call_key);
+        if (it == call_mux_state.end()) {
+            return;
+        }
+
+        erase_tgid_call_key_locked(it->second.tgid_call_key, call_key);
+        call_mux_state.erase(it);
     }
 
     /**
@@ -1083,7 +1695,7 @@ private:
             }
         }
 
-        call_mux_state.erase(call_key);
+        erase_call_mux_state_locked(call_key);
         mux_buffered_frames.erase(call_key);
     }
 
@@ -1148,44 +1760,6 @@ private:
                                    << ", callKey = " << req.call_key
                                    << ", lane = " << req.lane_key
                                    << ", sourceTg = " << req.source_tgid;
-    }
-
-    /**
-     * @brief Supersedes any existing calls for the same source TGID with a new call.
-     * @param lane_key The lane key for the calls.
-     * @param source_tgid The source talkgroup ID to match.
-     * @param new_call_key The new call key that supersedes existing calls.
-     */
-    void supersede_calls_for_source_tgid(const std::string& lane_key, long source_tgid, const std::string& new_call_key) {
-        std::vector<SyntheticEndRequest> superseded;
-
-        // scope is intentional
-        {
-            std::lock_guard<std::mutex> lock(mux_mutex);
-            for (auto& pair : call_mux_state) {
-                const std::string& existing_call_key = pair.first;
-                CallMuxState& state = pair.second;
-
-                if (existing_call_key == new_call_key) {
-                    continue;
-                }
-
-                if (state.lane_key != lane_key || state.source_tgid != source_tgid) {
-                    continue;
-                }
-
-                if (state.ended || state.synthetic_end_queued) {
-                    continue;
-                }
-
-                state.synthetic_end_queued = true;
-                superseded.push_back(make_synthetic_end_request_locked(existing_call_key, state));
-            }
-        }
-
-        for (const auto& req : superseded) {
-            inject_synthetic_end_request(req, "superseded-by-new-call-same-source-tgid");
-        }
     }
 
     /**
@@ -1343,7 +1917,7 @@ private:
     void complete_lane_and_promote_locked(const std::string& lane_key, const std::string& finished_call_key) {
         auto lane_it = mux_lane_state.find(lane_key);
         if (lane_it == mux_lane_state.end()) {
-            call_mux_state.erase(finished_call_key);
+            erase_call_mux_state_locked(finished_call_key);
             mux_buffered_frames.erase(finished_call_key);
             return;
         }
@@ -1353,7 +1927,7 @@ private:
             lane.active_call_key.clear();
         }
 
-        call_mux_state.erase(finished_call_key);
+        erase_call_mux_state_locked(finished_call_key);
         mux_buffered_frames.erase(finished_call_key);
 
         while (lane.active_call_key.empty()) {
@@ -1377,12 +1951,13 @@ private:
 
             flush_mux_buffered_frames_locked(next_call_key);
 
-            if (!next_it->second.ended) {
+            const bool next_ended = next_it->second.ended;
+            if (!next_ended) {
                 break;
             }
 
             lane.active_call_key.clear();
-            call_mux_state.erase(next_it);
+            erase_call_mux_state_locked(next_call_key);
             mux_buffered_frames.erase(next_call_key);
         }
 
@@ -1434,6 +2009,18 @@ private:
         // Track queued-call freshness so stale promotion can recover if call_end
         // arrives without additional voice callbacks for this call.
         call_state.last_activity = now;
+        call_state.buffered_frames++;
+
+        if (!call_state.buffered_log_sent) {
+            call_state.buffered_log_sent = true;
+            BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: mux lane buffering call behind active call"
+                                       << ", lane = " << lane_key
+                                       << ", callKey = " << call_key
+                                       << ", activeCallKey = " << lane.active_call_key
+                                       << ", waiting = " << lane.waiting_calls.size()
+                                       << ", dstTg = " << frame.dst_tgid
+                                       << ", endOfCall = " << frame.end_of_call;
+        }
 
         buffer_mux_frame_locked(call_key, std::move(frame));
     }
@@ -1784,6 +2371,7 @@ private:
             frame.lane_key = lane_key;
         }
 
+        const FrameLogInfo queued_info = make_frame_log_info(frame);
         if (queue_size >= max_queue_depth) {
             bool dropped = false;
 
@@ -1793,6 +2381,7 @@ private:
                 own_it->second.pop_front();
                 queue_size--;
                 adjust_drop_accounting_locked(dropped_frame);
+                note_frame_dropped(make_frame_log_info(dropped_frame), "outbound queue overflow");
                 if (own_it->second.empty()) {
                     lane_queues.erase(own_it);
                     lane_in_rr.erase(lane_key);
@@ -1812,6 +2401,7 @@ private:
                         it->second.pop_front();
                         queue_size--;
                         adjust_drop_accounting_locked(dropped_frame);
+                        note_frame_dropped(make_frame_log_info(dropped_frame), "outbound queue overflow");
                         if (it->second.empty()) {
                             lane_queues.erase(it);
                             lane_in_rr.erase(rr_lane);
@@ -1842,6 +2432,15 @@ private:
         }
         lane_queue.push_back(std::move(frame));
         queue_size++;
+        if (net_state != NET_STAT_RUNNING && queue_size == 1U) {
+            BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: outbound queue started while FNE session is not running"
+                                       << ", state = " << net_state_name(net_state)
+                                       << ", lane = " << queued_info.lane_key
+                                       << ", callKey = " << queued_info.call_key
+                                       << ", dstTg = " << queued_info.dst_tgid
+                                       << ", payloadBytes = " << queued_info.payload_size;
+        }
+        note_outbound_queued(queued_info);
 
         if (lane_in_rr.insert(lane_key).second) {
             lane_rr.push_back(lane_key);
@@ -1968,9 +2567,7 @@ private:
                     continue;
                 }
 
-                if (!has_pending_non_end_frames_for_call_locked(call_key)) {
-                    return true;
-                }
+                return true;
             }
         }
 
@@ -2124,11 +2721,6 @@ private:
                 continue;
             }
 
-            if (candidate.end_of_call && has_pending_non_end_frames_for_call_locked(candidate.call_key)) {
-                lane_rr.push_back(lane_key);
-                continue;
-            }
-
             if (candidate.dst_tgid != 0U) {
                 auto active_it = dst_tgid_active_calls.find(candidate.dst_tgid);
                 if (active_it != dst_tgid_active_calls.end() && active_it->second != candidate.call_key) {
@@ -2146,6 +2738,21 @@ private:
                                                    << ", ownerDispatched = " << owner_has_dispatched;
                         dst_tgid_active_calls.erase(active_it);
                     } else {
+                        dst_tgid_blocked_frames++;
+                        const std::string block_key = make_dst_tgid_block_key(candidate.dst_tgid, active_it->second, candidate.call_key);
+                        uint64_t& blocked_for_pair = dst_tgid_blocked_call_counts[block_key];
+                        blocked_for_pair++;
+                        if (blocked_for_pair == 1U || (blocked_for_pair % 500U) == 0U || (dst_tgid_blocked_frames % 1000U) == 0U) {
+                            BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: dstTg owner blocking queued frame"
+                                                       << ", dstTg = " << candidate.dst_tgid
+                                                       << ", ownerCallKey = " << active_it->second
+                                                       << ", waitingCallKey = " << candidate.call_key
+                                                       << ", ownerQueued = " << owner_has_queued
+                                                       << ", ownerSendable = " << owner_has_sendable
+                                                       << ", ownerDispatched = " << owner_has_dispatched
+                                                       << ", pairBlockedFrames = " << blocked_for_pair
+                                                       << ", blockedFrames = " << dst_tgid_blocked_frames;
+                        }
                         lane_rr.push_back(lane_key);
                         continue;
                     }
@@ -2156,8 +2763,15 @@ private:
             it->second.pop_front();
             queue_size--;
 
-            if (out.dst_tgid != 0U && !out.end_of_call) {
-                dst_tgid_active_calls[out.dst_tgid] = out.call_key;
+            if (out.dst_tgid != 0U) {
+                auto active_it = dst_tgid_active_calls.find(out.dst_tgid);
+                if (active_it == dst_tgid_active_calls.end()) {
+                    dst_tgid_active_calls[out.dst_tgid] = out.call_key;
+                    BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: acquired dstTg owner"
+                                             << ", dstTg = " << out.dst_tgid
+                                             << ", callKey = " << out.call_key
+                                             << ", endOfCall = " << out.end_of_call;
+                }
             }
 
             if (!out.end_of_call) {
@@ -2168,11 +2782,6 @@ private:
                     } else {
                         pending_non_end_frames.erase(count_it);
                     }
-                }
-            } else if (out.dst_tgid != 0U) {
-                auto active_it = dst_tgid_active_calls.find(out.dst_tgid);
-                if (active_it != dst_tgid_active_calls.end() && active_it->second == out.call_key) {
-                    dst_tgid_active_calls.erase(active_it);
                 }
             }
 
@@ -2190,10 +2799,48 @@ private:
     }
 
     /**
+     * @brief Releases destination TGID ownership after an end-of-call frame has been sent.
+     * @param frame Sent outbound frame.
+     */
+    void release_dst_tgid_owner_for_sent_frame(const OutboundFrame& frame) {
+        if (!frame.end_of_call || frame.dst_tgid == 0U) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        auto active_it = dst_tgid_active_calls.find(frame.dst_tgid);
+        if (active_it != dst_tgid_active_calls.end() && active_it->second == frame.call_key) {
+            dst_tgid_active_calls.erase(active_it);
+            dst_tgid_owner_releases++;
+            BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: released dstTg owner after TDU send"
+                                    << ", dstTg = " << frame.dst_tgid
+                                    << ", callKey = " << frame.call_key
+                                    << ", releases = " << dst_tgid_owner_releases;
+        } else {
+            BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: TDU sent but dstTg owner was missing or changed"
+                                       << ", dstTg = " << frame.dst_tgid
+                                       << ", callKey = " << frame.call_key
+                                       << ", currentOwner = " << ((active_it != dst_tgid_active_calls.end()) ? active_it->second : "");
+        }
+
+        const std::string block_prefix = std::to_string(frame.dst_tgid) + ":";
+        for (auto it = dst_tgid_blocked_call_counts.begin(); it != dst_tgid_blocked_call_counts.end(); ) {
+            if (it->first.compare(0U, block_prefix.size(), block_prefix) == 0) {
+                it = dst_tgid_blocked_call_counts.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        clear_call_diagnostics(frame.call_key);
+    }
+
+    /**
      * @brief Generates a random stream ID for the session.
      * @returns uint32_t A random stream ID in the range [1, 0xFFFFFFFE].
      */
     uint32_t random_stream_id() {
+        std::lock_guard<std::mutex> lock(rng_mutex);
         std::uniform_int_distribution<uint32_t> dist(1U, 0xFFFFFFFEU);
         return dist(rng);
     }
@@ -2286,9 +2933,11 @@ private:
         sender_worker_lane_counts.assign(worker_count, 0U);
 
         for (size_t i = 0; i < worker_count; i++) {
-            auto state = std::make_unique<SenderWorkerState>();
-            state->thread = std::thread(&DVMTRP25Stream::sender_worker_loop, this, i);
-            sender_workers.push_back(std::move(state));
+            sender_workers.push_back(std::make_unique<SenderWorkerState>());
+        }
+
+        for (size_t i = 0; i < worker_count; i++) {
+            sender_workers[i]->thread = std::thread(&DVMTRP25Stream::sender_worker_loop, this, i);
         }
     }
 
@@ -2338,6 +2987,13 @@ private:
 
         std::lock_guard<std::mutex> accounting_lock(dispatch_accounting_mutex);
         pending_dispatched_frames.clear();
+
+        if (!drained_call_keys.empty()) {
+            reset_dropped_frames += drained_call_keys.size();
+            BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: reset cleared sender dispatch queues"
+                                       << ", frames = " << drained_call_keys.size()
+                                       << ", totalResetDropped = " << reset_dropped_frames;
+        }
     }
 
     /**
@@ -2378,8 +3034,12 @@ private:
      * @param frame Outbound frame to dispatch.
      */
     void dispatch_protocol_frame(OutboundFrame frame) {
+        const FrameLogInfo frame_info = make_frame_log_info(frame);
         if (sender_workers.empty()) {
-            send_protocol_frame(frame);
+            note_sender_dispatched(frame_info, 0U, 0U);
+            if (send_protocol_frame(frame)) {
+                release_dst_tgid_owner_for_sent_frame(frame);
+            }
             return;
         }
 
@@ -2388,25 +3048,32 @@ private:
         const size_t index = get_or_assign_sender_worker_for_lane(lane_key);
         SenderWorkerState& worker_state = *sender_workers[index];
         std::string dropped_call_key;
+        FrameLogInfo dropped_frame_info;
         bool dropped_from_worker_queue = false;
+        size_t worker_depth = 0U;
 
         increment_pending_dispatch_for_call(frame_call_key);
 
         {
             std::lock_guard<std::mutex> lock(worker_state.mutex);
             if (worker_state.queue.size() >= sender_worker_max_queue_depth) {
-                dropped_call_key = worker_state.queue.front().call_key;
+                OutboundFrame dropped_frame = std::move(worker_state.queue.front());
+                dropped_call_key = dropped_frame.call_key;
+                dropped_frame_info = make_frame_log_info(dropped_frame);
                 worker_state.queue.pop_front();
                 dropped_frames++;
                 dropped_from_worker_queue = true;
             }
             worker_state.queue.push_back(std::move(frame));
+            worker_depth = worker_state.queue.size();
         }
 
         if (dropped_from_worker_queue) {
             decrement_pending_dispatch_for_call(dropped_call_key);
+            note_frame_dropped(dropped_frame_info, "sender worker queue overflow");
         }
 
+        note_sender_dispatched(frame_info, index, worker_depth);
         worker_state.cv.notify_one();
     }
 
@@ -2439,7 +3106,9 @@ private:
             }
 
             if (have_frame) {
-                send_protocol_frame(frame);
+                if (send_protocol_frame(frame)) {
+                    release_dst_tgid_owner_for_sent_frame(frame);
+                }
                 decrement_pending_dispatch_for_call(frame.call_key);
             }
         }
@@ -2451,6 +3120,7 @@ private:
      */
     void worker_loop() {
         while (running.load()) {
+            const auto now = std::chrono::steady_clock::now();
             recv_control_packets();
             handle_session_timers();
             promote_stale_mux_lanes();
@@ -2468,6 +3138,12 @@ private:
                     dispatch_protocol_frame(std::move(frame));
                     dispatches++;
                 }
+
+                if (dispatches == 0) {
+                    log_running_queue_stall(now);
+                }
+            } else {
+                log_queue_waiting_for_session(now);
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -2585,6 +3261,10 @@ private:
         const uint8_t *payload = packet + RTP_FIXED_OVERHEAD;
 
         if (func == NET_FUNC::ACK) {
+            BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: received ACK from FNE"
+                                    << ", state = " << net_state_name(net_state)
+                                    << ", msgLen = " << msg_len;
+
             if (net_state == NET_STAT_WAITING_LOGIN) {
                 if (msg_len >= 10U) {
                     std::memcpy(salt, payload + 6U, sizeof(salt));
@@ -2592,25 +3272,33 @@ private:
                     std::memset(salt, 0x00, sizeof(salt));
                 }
                 
-                send_authorisation();
-                net_state = NET_STAT_WAITING_AUTHORISATION;
-                next_retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(fne_config.retryInterval);
+                if (send_authorisation()) {
+                    set_net_state(NET_STAT_WAITING_AUTHORISATION, "login ACK");
+                    next_retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(fne_config.retryInterval);
+                }
             } else if (net_state == NET_STAT_WAITING_AUTHORISATION) {
-                send_config();
-                net_state = NET_STAT_WAITING_CONFIG;
-                next_retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(fne_config.retryInterval);
+                if (send_config()) {
+                    set_net_state(NET_STAT_WAITING_CONFIG, "authorisation ACK");
+                    next_retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(fne_config.retryInterval);
+                }
             } else if (net_state == NET_STAT_WAITING_CONFIG) {
-                net_state = NET_STAT_RUNNING;
+                set_net_state(NET_STAT_RUNNING, "config ACK");
                 awaiting_pong = false;
                 missed_ping_count = 0U;
                 next_ping_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(FNE_PING_INTERVAL_MS);
                 BOOST_LOG_TRIVIAL(info) << "dvmtrp25stream: FNE session running";
+            } else {
+                BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: unexpected ACK from FNE"
+                                           << ", state = " << net_state_name(net_state)
+                                           << ", msgLen = " << msg_len;
             }
             return;
         }
 
         if (func == NET_FUNC::NAK) {
-            BOOST_LOG_TRIVIAL(error) << "dvmtrp25stream: received NAK from FNE, resetting session";
+            BOOST_LOG_TRIVIAL(error) << "dvmtrp25stream: received NAK from FNE, resetting session"
+                                     << ", state = " << net_state_name(net_state)
+                                     << ", msgLen = " << msg_len;
             reset_session();
             return;
         }
@@ -2624,23 +3312,28 @@ private:
 
     /**
      * @brief Sends a login packet to the FNE server to initiate the session.
+     * @returns bool True when the packet was sent.
      */
-    void send_login() {
+    bool send_login() {
         std::vector<uint8_t> payload(8U, 0x00U);
         std::memcpy(payload.data(), TAG_REPEATER_LOGIN, 4U);
         SET_UINT32(fne_config.peerId, payload.data(), 4U);
 
         login_stream_id = random_stream_id();
-        send_enveloped(payload, NET_FUNC::RPTL, NET_SUBFUNC::NOP, next_seq(false), login_stream_id);
+        if (!send_enveloped(payload, NET_FUNC::RPTL, NET_SUBFUNC::NOP, next_seq(false), login_stream_id)) {
+            return false;
+        }
 
-        net_state = NET_STAT_WAITING_LOGIN;
+        set_net_state(NET_STAT_WAITING_LOGIN, "login sent");
         BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: sent login";
+        return true;
     }
 
     /**
      * @brief Sends an authorization packet to the FNE server using the provided password and salt.
+     * @returns bool True when the packet was sent.
      */
-    void send_authorisation() {
+    bool send_authorisation() {
         std::vector<uint8_t> payload(40U, 0x00U);
         std::memcpy(payload.data(), TAG_REPEATER_AUTH, 4U);
         SET_UINT32(fne_config.peerId, payload.data(), 4U);
@@ -2654,14 +3347,19 @@ private:
         SHA256(hash_input.data(), hash_input.size(), digest);
         std::memcpy(payload.data() + 8U, digest, SHA256_DIGEST_LENGTH);
 
-        send_enveloped(payload, NET_FUNC::RPTK, NET_SUBFUNC::NOP, next_seq(false), login_stream_id);
+        if (!send_enveloped(payload, NET_FUNC::RPTK, NET_SUBFUNC::NOP, next_seq(false), login_stream_id)) {
+            return false;
+        }
+
         BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: sent auth";
+        return true;
     }
 
     /**
      * @brief Sends a configuration packet to the FNE server with the current repeater settings.
+     * @returns bool True when the packet was sent.
      */
-    void send_config() {
+    bool send_config() {
         json config = json::object();
         config["identity"] = fne_config.identity;
         config["rxFrequency"] = 0U;
@@ -2696,8 +3394,12 @@ private:
         std::memcpy(payload.data(), TAG_REPEATER_CONFIG, 4U);
         std::memcpy(payload.data() + 8U, cfg_json.data(), cfg_json.size());
 
-        send_enveloped(payload, NET_FUNC::RPTC, NET_SUBFUNC::NOP, RTP_END_OF_CALL_SEQ, login_stream_id);
+        if (!send_enveloped(payload, NET_FUNC::RPTC, NET_SUBFUNC::NOP, RTP_END_OF_CALL_SEQ, login_stream_id)) {
+            return false;
+        }
+
         BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: sent config";
+        return true;
     }
 
     /**
@@ -2789,9 +3491,10 @@ private:
                                      << ", frameLen = " << (uint32_t)(frame.payload[23U]);
         }
 
-        send_enveloped(frame.payload, NET_FUNC::PROTOCOL, NET_SUBFUNC::PROTOCOL_SUBFUNC_P25, seq, stream_id, timestamp, true);
+        const FrameLogInfo frame_info = make_frame_log_info(frame);
+        note_protocol_send_attempt(frame_info, stream_id, seq, timestamp);
 
-        return true;
+        return send_enveloped(frame.payload, NET_FUNC::PROTOCOL, NET_SUBFUNC::PROTOCOL_SUBFUNC_P25, seq, stream_id, timestamp, true);
     }
 
     /**
@@ -2804,7 +3507,7 @@ private:
       * @param timestamp Optional RTP timestamp.
       * @param has_timestamp True when timestamp is provided by caller.
      */
-    void send_enveloped(const std::vector<uint8_t> &payload, uint8_t func, uint8_t subfunc, uint16_t seq,
+    bool send_enveloped(const std::vector<uint8_t> &payload, uint8_t func, uint8_t subfunc, uint16_t seq,
           uint32_t stream_id, uint32_t timestamp = 0U, bool has_timestamp = false) {
         std::vector<uint8_t> packet(RTP_HEADER_LENGTH_BYTES + RTP_EXTENSION_HEADER_LENGTH_BYTES + RTP_FNE_HEADER_LENGTH_BYTES + payload.size(), 0x00U);
 
@@ -2846,7 +3549,7 @@ private:
         if (ec) {
             BOOST_LOG_TRIVIAL(error) << "dvmtrp25stream: send error: " << ec.message();
             reset_session();
-            return;
+            return false;
         }
 
         if (func == NET_FUNC::PROTOCOL) {
@@ -2866,6 +3569,8 @@ private:
                                      << ", payloadType = " << (uint32_t)(payload_type)
                                      << ", payloadBytes = " << payload.size();
         }
+
+        return true;
     }
 
     /**
@@ -2873,13 +3578,14 @@ private:
      */
     void reset_session() {
         std::lock_guard<std::mutex> reset_lock(reset_mutex);
-        net_state = NET_STAT_WAITING_CONNECT;
+        set_net_state(NET_STAT_WAITING_CONNECT, "reset_session");
         login_stream_id = 0;
         std::memset(salt, 0x00, sizeof(salt));
 
         // scope is intentional
         {
             std::lock_guard<std::mutex> lock(mux_mutex);
+            tgid_call_key_to_call_key.clear();
             mux_lane_state.clear();
             call_mux_state.clear();
             mux_buffered_frames.clear();
@@ -2888,12 +3594,25 @@ private:
         // scope is intentional
         {
             std::lock_guard<std::mutex> lock(queue_mutex);
+            const size_t cleared_frames = queue_size;
+            const size_t cleared_lanes = lane_queues.size();
+            const size_t cleared_dst_owners = dst_tgid_active_calls.size();
             lane_queues.clear();
             lane_rr.clear();
             lane_in_rr.clear();
             pending_non_end_frames.clear();
             dst_tgid_active_calls.clear();
+            dst_tgid_blocked_call_counts.clear();
             queue_size = 0U;
+
+            if (cleared_frames > 0U || cleared_dst_owners > 0U) {
+                reset_dropped_frames += cleared_frames;
+                BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: reset cleared outbound queue"
+                                           << ", frames = " << cleared_frames
+                                           << ", lanes = " << cleared_lanes
+                                           << ", dstOwners = " << cleared_dst_owners
+                                           << ", totalResetDropped = " << reset_dropped_frames;
+            }
         }
 
         // scope is intentional
@@ -2910,8 +3629,19 @@ private:
             p25_call_state.clear();
         }
 
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> lock(call_diagnostic_mutex);
+            call_diagnostic_state.clear();
+            invalid_source_drop_keys.clear();
+        }
+
         next_retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(fne_config.retryInterval);
         next_ping_at = std::chrono::steady_clock::time_point{};
+        next_queue_wait_log_at = std::chrono::steady_clock::time_point{};
+        next_running_queue_stall_log_at = std::chrono::steady_clock::time_point{};
+        last_queue_wait_state = NET_STAT_INVALID;
+        last_queue_wait_size = 0U;
         awaiting_pong = false;
         missed_ping_count = 0U;
     }
@@ -2941,6 +3671,7 @@ private:
     std::unordered_set<std::string> lane_in_rr;
     std::unordered_map<std::string, size_t> pending_non_end_frames;
     std::unordered_map<uint32_t, std::string> dst_tgid_active_calls;
+    std::unordered_map<std::string, uint64_t> dst_tgid_blocked_call_counts;
     size_t queue_size = 0;
     std::mutex queue_mutex;
 
@@ -2960,8 +3691,13 @@ private:
 
     std::unordered_map<std::string, MuxLaneState> mux_lane_state;
     std::unordered_map<std::string, CallMuxState> call_mux_state;
+    std::unordered_map<std::string, std::string> tgid_call_key_to_call_key;
     std::unordered_map<std::string, std::deque<OutboundFrame>> mux_buffered_frames;
     std::mutex mux_mutex;
+
+    std::unordered_map<std::string, CallDiagnosticState> call_diagnostic_state;
+    std::unordered_set<std::string> invalid_source_drop_keys;
+    std::mutex call_diagnostic_mutex;
 
     NET_CONN_STATUS net_state = NET_STAT_INVALID;
     uint32_t login_stream_id = 0;
@@ -2972,15 +3708,26 @@ private:
 
     std::chrono::steady_clock::time_point next_retry_at{};
     std::chrono::steady_clock::time_point next_ping_at{};
+    std::chrono::steady_clock::time_point next_queue_wait_log_at{};
+    std::chrono::steady_clock::time_point next_running_queue_stall_log_at{};
+    NET_CONN_STATUS last_queue_wait_state = NET_STAT_INVALID;
+    size_t last_queue_wait_size = 0U;
     bool awaiting_pong = false;
     uint32_t missed_ping_count = 0U;
 
     uint64_t dropped_frames = 0;
     uint64_t dropped_mux_frames = 0;
+    uint64_t dst_tgid_blocked_frames = 0;
+    uint64_t dst_tgid_owner_releases = 0;
+    uint64_t reset_dropped_frames = 0;
+    uint64_t call_end_fallback_matches = 0;
+    uint64_t queue_wait_logs = 0;
+    uint64_t running_queue_stall_logs = 0;
     uint32_t mux_stale_call_ms = 1500;
     uint32_t mux_force_call_ms = 12000;
 
     std::mt19937 rng{std::random_device{}()};
+    std::mutex rng_mutex;
 };
 
 BOOST_DLL_ALIAS(
