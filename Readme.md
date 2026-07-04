@@ -39,7 +39,10 @@ For more information, see https://github.com/TrunkRecorder/trunk-recorder/blob/m
     "identity": "trunk-recorder",
     "maxMissedPings": 10,
     "retryIntervalMs": 3000,
-    "pacedCallTimeoutMs": 10000
+    "pacedCallTimeoutMs": 10000,
+    "orphanCallTimeoutMs": 12000,
+    "endedCallCleanupMs": 30000,
+    "sendWorkers": 4
   },
   "maxQueueDepth": 8192,
   "routes": [
@@ -66,6 +69,9 @@ For more information, see https://github.com/TrunkRecorder/trunk-recorder/blob/m
 - `maxMissedPings`: number of consecutive keepalive `PING` messages that do not receive a `PONG` response before the session is reset and reconnect is attempted.
 - `retryIntervalMs`: reconnect/login retry interval after session reset or startup.
 - `pacedCallTimeoutMs`: max time to keep requeueing a paced call before dropping its blocked frames (default 10000 ms).
+- `orphanCallTimeoutMs`: inactivity timeout used to detect orphaned active calls and inject a synthetic call end (default 12000 ms, minimum 1000 ms).
+- `endedCallCleanupMs`: retention time for ended calls before clearing mux tracking state (default 30000 ms, minimum 5000 ms).
+- `sendWorkers`: number of parallel sender worker threads used for lane dispatch (default 4, clamped to 1..32).
 
 ## Example Muxed Talkgroups
 
