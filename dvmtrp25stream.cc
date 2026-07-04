@@ -2561,10 +2561,95 @@ private:
                 }
 
                 if (!frame.end_of_call) {
-                    if (is_non_end_frame_ready(call_key, now)) {
-                        return true;
-                    }
+                    return is_non_end_frame_ready(call_key, now);
+                }
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @brief Ensures a lane with queued frames is present in the round-robin list.
+     * @param lane_key Lane key to refresh.
+     */
+    void ensure_lane_rr_entry_locked(const std::string& lane_key) {
+        auto it = lane_queues.find(lane_key);
+        if (it == lane_queues.end() || it->second.empty()) {
+            lane_in_rr.erase(lane_key);
+            return;
+        }
+
+        lane_in_rr.insert(lane_key);
+        if (std::find(lane_rr.begin(), lane_rr.end(), lane_key) == lane_rr.end()) {
+            lane_rr.push_back(lane_key);
+        }
+    }
+
+    /**
+     * @brief Removes a lane from the round-robin list.
+     * @param lane_key Lane key to remove.
+     */
+    void remove_lane_rr_entry_locked(const std::string& lane_key) {
+        lane_in_rr.erase(lane_key);
+        auto rr_it = std::find(lane_rr.begin(), lane_rr.end(), lane_key);
+        if (rr_it != lane_rr.end()) {
+            lane_rr.erase(rr_it);
+        }
+    }
+
+    /**
+     * @brief Updates queue accounting after a frame has been popped.
+     * @param frame Popped frame.
+     */
+    void account_popped_frame_locked(const OutboundFrame& frame) {
+        if (frame.end_of_call) {
+            return;
+        }
+
+        auto count_it = pending_non_end_frames.find(frame.call_key);
+        if (count_it != pending_non_end_frames.end()) {
+            if (count_it->second > 1U) {
+                count_it->second--;
+            } else {
+                pending_non_end_frames.erase(count_it);
+            }
+        }
+    }
+
+    /**
+     * @brief Pops the next ready queued frame for a specific call.
+     * @param call_key Per-call key to drain.
+     * @param now Current time point.
+     * @param out Reference to the OutboundFrame where the popped frame will be stored.
+     * @returns bool True if a frame was successfully popped.
+     */
+    bool pop_ready_frame_for_call_locked(const std::string& call_key,
+        const std::chrono::steady_clock::time_point& now, OutboundFrame& out) {
+        for (auto lane_it = lane_queues.begin(); lane_it != lane_queues.end(); ++lane_it) {
+            std::deque<OutboundFrame>& frames = lane_it->second;
+            for (auto frame_it = frames.begin(); frame_it != frames.end(); ++frame_it) {
+                if (frame_it->call_key != call_key) {
                     continue;
+                }
+
+                if (!frame_it->end_of_call && !is_non_end_frame_ready(call_key, now)) {
+                    return false;
+                }
+
+                const std::string lane_key = lane_it->first;
+                out = std::move(*frame_it);
+                frames.erase(frame_it);
+                queue_size--;
+                account_popped_frame_locked(out);
+
+                if (frames.empty()) {
+                    remove_lane_rr_entry_locked(lane_key);
+                    lane_queues.erase(lane_it);
+                } else {
+                    ensure_lane_rr_entry_locked(lane_key);
                 }
 
                 return true;
@@ -2721,32 +2806,50 @@ private:
                 continue;
             }
 
-            if (candidate.dst_tgid != 0U) {
-                auto active_it = dst_tgid_active_calls.find(candidate.dst_tgid);
-                if (active_it != dst_tgid_active_calls.end() && active_it->second != candidate.call_key) {
-                    const bool owner_has_queued = queue_has_frame_for_call_locked(active_it->second);
-                    const bool owner_has_sendable = queue_has_sendable_frame_for_call_locked(active_it->second, now);
-                    const bool owner_has_dispatched = has_pending_dispatch_for_call(active_it->second);
-                    const bool owner_stream_stale = is_stream_state_stale_for_call_locked(active_it->second, now);
+            const uint32_t candidate_dst_tgid = candidate.dst_tgid;
+            const std::string candidate_call_key = candidate.call_key;
+            if (candidate_dst_tgid != 0U) {
+                auto active_it = dst_tgid_active_calls.find(candidate_dst_tgid);
+                if (active_it != dst_tgid_active_calls.end() && active_it->second != candidate_call_key) {
+                    const std::string owner_call_key = active_it->second;
+                    const bool owner_has_queued = queue_has_frame_for_call_locked(owner_call_key);
+                    const bool owner_has_sendable = queue_has_sendable_frame_for_call_locked(owner_call_key, now);
+                    const bool owner_has_dispatched = has_pending_dispatch_for_call(owner_call_key);
+                    const bool owner_stream_stale = is_stream_state_stale_for_call_locked(owner_call_key, now);
                     if ((!owner_has_queued && !owner_has_dispatched) ||
                         (owner_stream_stale && !owner_has_dispatched && !owner_has_sendable)) {
                         BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: releasing stale dstTg flush owner"
-                                                   << ", dstTg = " << candidate.dst_tgid
-                                                   << ", ownerCallKey = " << active_it->second
+                                                   << ", dstTg = " << candidate_dst_tgid
+                                                   << ", ownerCallKey = " << owner_call_key
                                                    << ", ownerQueued = " << owner_has_queued
                                                    << ", ownerSendable = " << owner_has_sendable
                                                    << ", ownerDispatched = " << owner_has_dispatched;
                         dst_tgid_active_calls.erase(active_it);
                     } else {
+                        if (owner_has_sendable && !owner_has_dispatched &&
+                            pop_ready_frame_for_call_locked(owner_call_key, now, out)) {
+                            ensure_lane_rr_entry_locked(lane_key);
+                            dst_tgid_owner_priority_frames++;
+                            if (dst_tgid_owner_priority_frames == 1U || (dst_tgid_owner_priority_frames % 500U) == 0U) {
+                                BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: prioritizing dstTg owner queued frame"
+                                                           << ", dstTg = " << candidate_dst_tgid
+                                                           << ", ownerCallKey = " << owner_call_key
+                                                           << ", waitingCallKey = " << candidate_call_key
+                                                           << ", endOfCall = " << out.end_of_call
+                                                           << ", priorityFrames = " << dst_tgid_owner_priority_frames;
+                            }
+                            return true;
+                        }
+
                         dst_tgid_blocked_frames++;
-                        const std::string block_key = make_dst_tgid_block_key(candidate.dst_tgid, active_it->second, candidate.call_key);
+                        const std::string block_key = make_dst_tgid_block_key(candidate_dst_tgid, owner_call_key, candidate_call_key);
                         uint64_t& blocked_for_pair = dst_tgid_blocked_call_counts[block_key];
                         blocked_for_pair++;
                         if (blocked_for_pair == 1U || (blocked_for_pair % 500U) == 0U || (dst_tgid_blocked_frames % 1000U) == 0U) {
                             BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: dstTg owner blocking queued frame"
-                                                       << ", dstTg = " << candidate.dst_tgid
-                                                       << ", ownerCallKey = " << active_it->second
-                                                       << ", waitingCallKey = " << candidate.call_key
+                                                       << ", dstTg = " << candidate_dst_tgid
+                                                       << ", ownerCallKey = " << owner_call_key
+                                                       << ", waitingCallKey = " << candidate_call_key
                                                        << ", ownerQueued = " << owner_has_queued
                                                        << ", ownerSendable = " << owner_has_sendable
                                                        << ", ownerDispatched = " << owner_has_dispatched
@@ -3718,6 +3821,7 @@ private:
     uint64_t dropped_frames = 0;
     uint64_t dropped_mux_frames = 0;
     uint64_t dst_tgid_blocked_frames = 0;
+    uint64_t dst_tgid_owner_priority_frames = 0;
     uint64_t dst_tgid_owner_releases = 0;
     uint64_t reset_dropped_frames = 0;
     uint64_t call_end_fallback_matches = 0;
