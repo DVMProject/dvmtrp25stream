@@ -2148,6 +2148,20 @@ private:
                 continue;
             }
 
+            bool owner_has_queued = false;
+            {
+                std::lock_guard<std::mutex> queue_lock(queue_mutex);
+                owner_has_queued = queue_has_frame_for_call_locked(lane.active_call_key);
+            }
+
+            const bool owner_has_dispatched = has_pending_dispatch_for_call(lane.active_call_key);
+
+            // Do not preempt a call that is actively flushing frames; stale
+            // promotion here causes audible ping-pong between queued calls.
+            if (owner_has_queued || owner_has_dispatched) {
+                continue;
+            }
+
             const auto& last = call_it->second.last_activity;
             if (last.time_since_epoch().count() == 0) {
                 stale_lanes.emplace_back(lane_key, lane.active_call_key);
@@ -2156,14 +2170,6 @@ private:
 
             const bool ended = call_it->second.ended;
             const auto threshold = ended ? stale_after : force_after;
-            const bool owner_has_queued = queue_has_frame_for_call_locked(lane.active_call_key);
-            const bool owner_has_sendable = queue_has_sendable_frame_for_call_locked(lane.active_call_key, now);
-            const bool owner_has_dispatched = has_pending_dispatch_for_call(lane.active_call_key);
-
-            if (!owner_has_dispatched && (!owner_has_queued || !owner_has_sendable)) {
-                stale_lanes.emplace_back(lane_key, lane.active_call_key);
-                continue;
-            }
 
             if (now - last > threshold) {
                 stale_lanes.emplace_back(lane_key, lane.active_call_key);
@@ -2863,9 +2869,24 @@ private:
      * @returns bool True if the non-end frame is ready to be sent, false otherwise.
      */
     bool is_non_end_frame_ready(const std::string& call_key, const std::chrono::steady_clock::time_point& now) const {
-        (void)call_key;
-        (void)now;
-        return true;
+        // Keep at most one in-flight non-end frame per call so worker queues
+        // cannot burst-drain an entire promoted call before pacing catches up.
+        if (has_pending_dispatch_for_call(call_key)) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> stream_lock(stream_state_mutex);
+        auto it = stream_state.find(call_key);
+        if (it == stream_state.end()) {
+            return true;
+        }
+
+        const auto next_send_at = it->second.next_protocol_send_at;
+        if (next_send_at.time_since_epoch().count() == 0) {
+            return true;
+        }
+
+        return now >= next_send_at;
     }
 
     /**
@@ -2901,39 +2922,11 @@ private:
             if (candidate_dst_tgid != 0U) {
                 auto active_it = dst_tgid_active_calls.find(candidate_dst_tgid);
                 if (active_it != dst_tgid_active_calls.end() && active_it->second != candidate_call_key) {
-                    const std::string owner_call_key = active_it->second;
-                    const bool owner_has_queued = queue_has_frame_for_call_locked(owner_call_key);
-                    const bool owner_has_sendable = queue_has_sendable_frame_for_call_locked(owner_call_key, now);
-                    const bool owner_has_dispatched = has_pending_dispatch_for_call(owner_call_key);
-                    const bool owner_stream_stale = is_stream_state_stale_for_call_locked(owner_call_key, now);
-                    if ((!owner_has_queued && !owner_has_dispatched) ||
-                        (owner_stream_stale && !owner_has_dispatched && !owner_has_sendable)) {
-                        BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: releasing stale dstTg flush owner"
-                                                   << ", dstTg = " << candidate_dst_tgid
-                                                   << ", ownerCallKey = " << owner_call_key
-                                                   << ", ownerQueued = " << owner_has_queued
-                                                   << ", ownerSendable = " << owner_has_sendable
-                                                   << ", ownerDispatched = " << owner_has_dispatched;
-                        dst_tgid_active_calls.erase(active_it);
-                    } else {
-                        dst_tgid_blocked_frames++;
-                        const std::string block_key = make_dst_tgid_block_key(candidate_dst_tgid, owner_call_key, candidate_call_key);
-                        uint64_t& blocked_for_pair = dst_tgid_blocked_call_counts[block_key];
-                        blocked_for_pair++;
-                        if (blocked_for_pair == 1U || (blocked_for_pair % 500U) == 0U || (dst_tgid_blocked_frames % 1000U) == 0U) {
-                            BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: dstTg owner blocking queued frame"
-                                                       << ", dstTg = " << candidate_dst_tgid
-                                                       << ", ownerCallKey = " << owner_call_key
-                                                       << ", waitingCallKey = " << candidate_call_key
-                                                       << ", ownerQueued = " << owner_has_queued
-                                                       << ", ownerSendable = " << owner_has_sendable
-                                                       << ", ownerDispatched = " << owner_has_dispatched
-                                                       << ", pairBlockedFrames = " << blocked_for_pair
-                                                       << ", blockedFrames = " << dst_tgid_blocked_frames;
-                        }
-                        lane_rr.push_back(lane_key);
-                        continue;
-                    }
+                    BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: dstTg owner rollover"
+                                             << ", dstTg = " << candidate_dst_tgid
+                                             << ", ownerCallKey = " << active_it->second
+                                             << ", nextCallKey = " << candidate_call_key;
+                    active_it->second = candidate_call_key;
                 }
             }
 
