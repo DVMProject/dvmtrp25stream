@@ -308,15 +308,17 @@ uint16_t CRC16_CCITT(const uint8_t *data, size_t len)
 }
 
 /**
- * @brief Generates a unique call key based on the short name and call number.
+ * @brief Generates a unique call key based on call identity fields.
  * @param short_name System short name.
  * @param call_num Trunk-recorder call number.
- * @returns std::string Stable key in the format "short_name:call_num".
+ * @param source_tgid Source talkgroup ID.
+ * @returns std::string Stable key in the format "short_name:call_num:source_tgid".
  */
-std::string make_call_key(const std::string& short_name, long call_num)
+std::string make_call_key(const std::string& short_name, long call_num, long source_tgid)
 {
     std::ostringstream oss;
-    oss << short_name << ":" << call_num;
+    const long normalized_source_tgid = (source_tgid < 0) ? 0 : source_tgid;
+    oss << short_name << ":" << call_num << ":" << normalized_source_tgid;
     return oss.str();
 }
 
@@ -696,7 +698,7 @@ public:
     int call_end(Call_Data_t call_info) override {
         const Route *route = find_route(call_info.talkgroup, call_info.short_name, call_info.encrypted);
         uint32_t dst_tgid = resolve_dst_tgid(route, call_info.talkgroup);
-        std::string call_key = make_call_key(call_info.short_name, call_info.call_num);
+        std::string call_key = make_call_key(call_info.short_name, call_info.call_num, call_info.talkgroup);
         const std::string tgid_call_key = make_tgid_call_key(call_info.short_name, call_info.talkgroup, dst_tgid);
 
         P25CallState state;
@@ -922,7 +924,7 @@ public:
         }
 
         const int sys_num = static_cast<int>(system->get_sys_id() & 0xFFFFU);
-        const std::string call_key = make_call_key(short_name, call->get_call_num());
+        const std::string call_key = make_call_key(short_name, call->get_call_num(), actual_tgid);
         const std::string tgid_call_key = make_tgid_call_key(short_name, actual_tgid, dst_tgid);
 
         bool queue_leading_silence = false;
