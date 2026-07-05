@@ -99,6 +99,14 @@ const uint32_t  PACKET_PAD = 8U;
 const uint32_t  MSG_HDR_SIZE = 24U;
 const uint32_t  P25_LDU1_PACKET_LENGTH = 193U;  // 24 byte header + DFSI data + 1 byte frame type + 12 byte enc sync
 const uint32_t  P25_LDU2_PACKET_LENGTH = 181U;  // 24 byte header + DFSI data + 1 byte frame type
+const uint32_t  P25_IMBE_FRAME_DURATION_MS = 20U;
+const uint32_t  P25_IMBE_FRAMES_PER_LDU = 9U;
+const uint32_t  P25_LDU_DURATION_MS = P25_IMBE_FRAME_DURATION_MS * P25_IMBE_FRAMES_PER_LDU;
+const uint32_t  P25_IMBE_SAMPLES_PER_FRAME = 160U;
+const uint32_t  P25_LDU_TIMESTAMP_SAMPLES = P25_IMBE_SAMPLES_PER_FRAME * P25_IMBE_FRAMES_PER_LDU;
+const uint32_t  P25_MAX_CONCEALMENT_SLOTS = P25_IMBE_FRAMES_PER_LDU;
+const uint32_t  P25_PACKETIZER_MAX_SLOTS_PER_TICK = 32U;
+const uint32_t  P25_PACKETIZER_RESET_GAP_MS = 500U;
 
 // TIA-102.BAAC-D Section 2.11
 /** @brief Data Unit ID(s) */
@@ -426,9 +434,16 @@ struct P25MessageHdr {
 struct P25CallState {
     std::array<std::array<uint8_t, RAW_IMBE_LENGTH_BYTES>, 9U> imbe{};
     uint8_t imbeCount = 0U;
+    std::deque<std::array<uint8_t, RAW_IMBE_LENGTH_BYTES>> buffered_imbe;
 
     bool nextIsLDU2 = false;
     bool leading_silence_sent = false;
+    bool encrypted = false;
+
+    std::string lane_key;
+    std::chrono::steady_clock::time_point next_imbe_emit_at{};
+    std::chrono::steady_clock::time_point last_imbe_received_at{};
+    uint32_t concealed_slots = 0U;
 
     P25MessageHdr header;
 };
@@ -744,9 +759,13 @@ public:
         }
 
         const uint8_t partial_imbe_count = have_state ? state.imbeCount : 0U;
+        if (have_state) {
+            flush_buffered_imbe_to_ready_ldus(state, call_key, lane_key);
+        }
+
         if (have_state && state.imbeCount > 0U) {
             const uint8_t *null_frame = call_info.encrypted ? ENCRYPTED_NULL_IMBE : NULL_IMBE;
-            while (state.imbeCount < 9U) {
+            while (state.imbeCount < P25_IMBE_FRAMES_PER_LDU) {
                 std::memcpy(state.imbe[state.imbeCount].data(), null_frame, RAW_IMBE_LENGTH_BYTES);
                 state.imbeCount++;
             }
@@ -906,13 +925,11 @@ public:
         const std::string call_key = make_call_key(short_name, call->get_call_num());
         const std::string tgid_call_key = make_tgid_call_key(short_name, actual_tgid, dst_tgid);
 
-        P25CallState ready_state;
-        bool emit_ldu = false;
-        bool emit_ldu2 = false;
         bool queue_leading_silence = false;
         P25MessageHdr leading_header;
         P25MessageHdr current_header;
         bool current_next_is_ldu2 = false;
+        const auto now = std::chrono::steady_clock::now();
 
         // scope is intentional
         {
@@ -934,26 +951,30 @@ public:
             // Keep IDs pinned to validated callback-local values for this frame.
             state.header.srcId = normalized_src;
             state.header.dstId = normalized_dst;
+            state.lane_key = lane_key;
+            state.encrypted = encrypted;
             current_header = state.header;
             current_next_is_ldu2 = state.nextIsLDU2;
 
-              if (!state.leading_silence_sent && state.imbeCount == 0U) {
-                  state.leading_silence_sent = true;
-                  queue_leading_silence = true;
-                  leading_header = state.header;
-              }
-
-            std::memcpy(state.imbe[state.imbeCount].data(), imbe.data(), RAW_IMBE_LENGTH_BYTES);
-            state.imbeCount++;
-
-            if (state.imbeCount >= 9U) {
-                ready_state = state;
-                emit_ldu = true;
-                emit_ldu2 = state.nextIsLDU2;
-
-                state.imbeCount = 0U;
-                state.nextIsLDU2 = !state.nextIsLDU2;
+            if (!state.leading_silence_sent && state.imbeCount == 0U && state.buffered_imbe.empty()) {
+                state.leading_silence_sent = true;
+                queue_leading_silence = true;
+                leading_header = state.header;
             }
+
+            const bool restart_packetizer =
+                state.next_imbe_emit_at.time_since_epoch().count() == 0 ||
+                (state.imbeCount == 0U && state.buffered_imbe.empty() &&
+                    state.last_imbe_received_at.time_since_epoch().count() != 0 &&
+                    now - state.last_imbe_received_at > std::chrono::milliseconds(P25_PACKETIZER_RESET_GAP_MS));
+            if (restart_packetizer) {
+                state.next_imbe_emit_at = now;
+                state.concealed_slots = 0U;
+            }
+
+            state.buffered_imbe.push_back(imbe);
+            state.last_imbe_received_at = now;
+            state.concealed_slots = 0U;
         }
 
         update_call_mux_state_from_voice(call_key, tgid_call_key, lane_key, actual_tgid, current_header, encrypted, current_next_is_ldu2);
@@ -974,46 +995,6 @@ public:
 
             update_call_mux_state_from_voice(call_key, tgid_call_key, lane_key, actual_tgid, leading_header, encrypted, false);
             queue_silence_ldu_pair(lane_key, call_key, leading_header, encrypted, false);
-        }
-
-        if (emit_ldu) {
-            OutboundFrame frame;
-            frame.call_key = call_key;
-            frame.end_of_call = false;
-            frame.payload = build_ldu_payload(ready_state, emit_ldu2);
-
-            if (frame.payload.size() >= MSG_HDR_SIZE &&
-                std::memcmp(frame.payload.data(), TAG_P25_DATA, 4U) == 0) {
-                const uint32_t hdr_src = ((uint32_t)(frame.payload[5U]) << 16) |
-                    ((uint32_t)(frame.payload[6U]) << 8) |
-                    ((uint32_t)(frame.payload[7U]) << 0);
-                const uint32_t hdr_dst = ((uint32_t)(frame.payload[8U]) << 16) |
-                    ((uint32_t)(frame.payload[9U]) << 8) |
-                    ((uint32_t)(frame.payload[10U]) << 0);
-
-                const uint32_t expected_src = effective_src & 0x00FFFFFFU;
-                const uint32_t expected_dst = dst_tgid & 0x00FFFFFFU;
-                if (hdr_src != expected_src || hdr_dst != expected_dst) {
-                    BOOST_LOG_TRIVIAL(error) << "dvmtrp25stream: built payload header mismatch"
-                                             << ", callKey = " << call_key
-                                             << ", expectedSrc = " << expected_src
-                                             << ", expectedDst = " << expected_dst
-                                             << ", hdrSrc = " << hdr_src
-                                             << ", hdrDst = " << hdr_dst
-                                             << ", duid = " << (uint32_t)(frame.payload[22U])
-                                             << ", frameLen = " << (uint32_t)(frame.payload[23U]);
-                }
-            }
-
-            schedule_mux_frame(lane_key, call_key, std::move(frame));
-
-            update_call_mux_state_from_voice(call_key, tgid_call_key, lane_key, actual_tgid, ready_state.header, encrypted, emit_ldu2 ? false : true);
-
-            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: queued " << (emit_ldu2 ? "LDU2" : "LDU1")
-                                     << ", callKey = " << call_key
-                                     << ", callNum = " << call->get_call_num()
-                                     << ", srcTg = " << actual_tgid
-                                     << ", dstTg = " << dst_tgid;
         }
 
         return 0;
@@ -1525,6 +1506,116 @@ private:
     }
 
     /**
+     * @brief Emits a completed 9-IMBE LDU from the current per-call packetizer state.
+     * @param state Per-call packetizer state.
+     * @param call_key Per-call key.
+     * @param lane_key Destination lane key.
+     */
+    void emit_ready_ldu_from_state(P25CallState& state, const std::string& call_key, const std::string& lane_key) {
+        if (state.imbeCount < P25_IMBE_FRAMES_PER_LDU) {
+            return;
+        }
+
+        OutboundFrame frame;
+        frame.call_key = call_key;
+        frame.end_of_call = false;
+        frame.payload = build_ldu_payload(state, state.nextIsLDU2);
+        schedule_mux_frame(lane_key, call_key, std::move(frame));
+
+        state.imbeCount = 0U;
+        state.nextIsLDU2 = !state.nextIsLDU2;
+    }
+
+    /**
+     * @brief Drains any buffered callback IMBEs into ready LDUs immediately.
+     * @param state Per-call packetizer state.
+     * @param call_key Per-call key.
+     * @param lane_key Destination lane key.
+     */
+    void flush_buffered_imbe_to_ready_ldus(P25CallState& state, const std::string& call_key, const std::string& lane_key) {
+        while (!state.buffered_imbe.empty()) {
+            std::memcpy(state.imbe[state.imbeCount].data(), state.buffered_imbe.front().data(), RAW_IMBE_LENGTH_BYTES);
+            state.buffered_imbe.pop_front();
+            state.imbeCount++;
+
+            if (state.imbeCount >= P25_IMBE_FRAMES_PER_LDU) {
+                emit_ready_ldu_from_state(state, call_key, lane_key);
+            }
+        }
+    }
+
+    /**
+     * @brief Advances active call packetizers on a fixed 20 ms IMBE clock.
+     * @param now Current worker-loop time.
+     */
+    void process_p25_packetizers(const std::chrono::steady_clock::time_point& now) {
+        std::vector<std::pair<std::string, std::string>> ready_ldu_logs;
+
+        // scope is intentional
+        {
+            std::lock_guard<std::mutex> lock(p25_state_mutex);
+
+            for (auto& pair : p25_call_state) {
+                const std::string& call_key = pair.first;
+                P25CallState& state = pair.second;
+                if (state.lane_key.empty()) {
+                    continue;
+                }
+
+                if (state.next_imbe_emit_at.time_since_epoch().count() == 0) {
+                    if (!state.buffered_imbe.empty()) {
+                        state.next_imbe_emit_at = now;
+                    } else {
+                        continue;
+                    }
+                }
+
+                uint32_t slots_processed = 0U;
+                while (state.next_imbe_emit_at <= now && slots_processed < P25_PACKETIZER_MAX_SLOTS_PER_TICK) {
+                    std::array<uint8_t, RAW_IMBE_LENGTH_BYTES> slot_imbe{};
+                    bool have_slot_imbe = false;
+
+                    if (!state.buffered_imbe.empty()) {
+                        slot_imbe = state.buffered_imbe.front();
+                        state.buffered_imbe.pop_front();
+                        state.concealed_slots = 0U;
+                        have_slot_imbe = true;
+                    } else if (state.last_imbe_received_at.time_since_epoch().count() != 0 &&
+                        now - state.last_imbe_received_at <= std::chrono::milliseconds(P25_LDU_DURATION_MS) &&
+                        state.concealed_slots < P25_MAX_CONCEALMENT_SLOTS) {
+                        const uint8_t* null_frame = state.encrypted ? ENCRYPTED_NULL_IMBE : NULL_IMBE;
+                        std::memcpy(slot_imbe.data(), null_frame, RAW_IMBE_LENGTH_BYTES);
+                        state.concealed_slots++;
+                        have_slot_imbe = true;
+                    }
+
+                    if (!have_slot_imbe) {
+                        if (state.imbeCount == 0U && state.buffered_imbe.empty()) {
+                            state.next_imbe_emit_at = std::chrono::steady_clock::time_point{};
+                        }
+                        break;
+                    }
+
+                    std::memcpy(state.imbe[state.imbeCount].data(), slot_imbe.data(), RAW_IMBE_LENGTH_BYTES);
+                    state.imbeCount++;
+                    state.next_imbe_emit_at += std::chrono::milliseconds(P25_IMBE_FRAME_DURATION_MS);
+                    slots_processed++;
+
+                    if (state.imbeCount >= P25_IMBE_FRAMES_PER_LDU) {
+                        ready_ldu_logs.emplace_back(call_key, state.nextIsLDU2 ? "LDU2" : "LDU1");
+                        emit_ready_ldu_from_state(state, call_key, state.lane_key);
+                    }
+                }
+            }
+        }
+
+        for (const auto& ready : ready_ldu_logs) {
+            BOOST_LOG_TRIVIAL(debug) << "dvmtrp25stream: packetizer queued " << ready.second
+                                     << ", callKey = " << ready.first;
+        }
+    }
+
+    /**
      * @brief Builds a full silence-only call state for one LDU emission.
      * @param header Message header to apply.
      * @param encrypted Whether encrypted silence pattern should be used.
@@ -1740,7 +1831,7 @@ private:
 
         if (have_state && state.imbeCount > 0U) {
             const uint8_t* null_frame = req.encrypted ? ENCRYPTED_NULL_IMBE : NULL_IMBE;
-            while (state.imbeCount < 9U) {
+            while (state.imbeCount < P25_IMBE_FRAMES_PER_LDU) {
                 std::memcpy(state.imbe[state.imbeCount].data(), null_frame, RAW_IMBE_LENGTH_BYTES);
                 state.imbeCount++;
             }
@@ -2770,18 +2861,9 @@ private:
      * @returns bool True if the non-end frame is ready to be sent, false otherwise.
      */
     bool is_non_end_frame_ready(const std::string& call_key, const std::chrono::steady_clock::time_point& now) const {
-        std::lock_guard<std::mutex> stream_lock(stream_state_mutex);
-        auto it = stream_state.find(call_key);
-        if (it == stream_state.end()) {
-            return true;
-        }
-
-        const auto& next_send_at = it->second.next_protocol_send_at;
-        if (next_send_at.time_since_epoch().count() == 0) {
-            return true;
-        }
-
-        return now >= next_send_at;
+        (void)call_key;
+        (void)now;
+        return true;
     }
 
     /**
@@ -2972,32 +3054,6 @@ private:
         }
 
         return seq;
-    }
-
-    /**
-     * @brief Reserves the next protocol send slot for a call at dispatch time.
-     * @param frame Outbound frame that is about to be queued to a sender worker.
-     */
-    void reserve_dispatch_pacing_slot(const OutboundFrame& frame) {
-        if (frame.end_of_call) {
-            return;
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> stream_lock(stream_state_mutex);
-
-        StreamState& state = stream_state[frame.call_key];
-        if (state.streamId == 0U) {
-            state.streamId = random_stream_id();
-            state.timestampInit = false;
-        }
-
-        if (state.next_protocol_send_at.time_since_epoch().count() == 0 || state.next_protocol_send_at < now) {
-            state.next_protocol_send_at = now + std::chrono::milliseconds(160);
-            return;
-        }
-
-        state.next_protocol_send_at += std::chrono::milliseconds(160);
     }
 
     /**
@@ -3234,6 +3290,7 @@ private:
             handle_session_timers();
             promote_stale_mux_lanes();
             reap_orphan_calls();
+            process_p25_packetizers(now);
 
             if (net_state == NET_STAT_RUNNING) {
                 int dispatches = 0;
@@ -3243,7 +3300,6 @@ private:
                         break;
                     }
 
-                    reserve_dispatch_pacing_slot(frame);
                     dispatch_protocol_frame(std::move(frame));
                     dispatches++;
                 }
@@ -3570,16 +3626,20 @@ private:
             seq = next_seq(frame.end_of_call);
 
             const auto now_sys = std::chrono::system_clock::now();
-            const uint32_t base_timestamp = (uint32_t)(std::chrono::duration_cast<std::chrono::milliseconds>(now_sys.time_since_epoch()).count() & 0xFFFFFFFFULL);
+            const uint32_t base_timestamp = (uint32_t)((std::chrono::duration_cast<std::chrono::milliseconds>(now_sys.time_since_epoch()).count() * 8ULL) & 0xFFFFFFFFULL);
             if (!stream->timestampInit) {
                 stream->timestampInit = true;
                 stream->timestamp = base_timestamp;
             } else if (seq != RTP_END_OF_CALL_SEQ) {
-                stream->timestamp += (uint32_t)(8000U / 133U);
+                stream->timestamp += P25_LDU_TIMESTAMP_SAMPLES;
             }
 
             timestamp = stream->timestamp;
             stream_id = stream->streamId;
+
+            if (!frame.end_of_call) {
+                stream->next_protocol_send_at = now + std::chrono::milliseconds(P25_LDU_DURATION_MS);
+            }
 
             if (frame.end_of_call) {
                 stream_state.erase(frame.call_key);
