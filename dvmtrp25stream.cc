@@ -2914,21 +2914,6 @@ private:
                                                    << ", ownerDispatched = " << owner_has_dispatched;
                         dst_tgid_active_calls.erase(active_it);
                     } else {
-                        if (owner_has_sendable && !owner_has_dispatched &&
-                            pop_ready_frame_for_call_locked(owner_call_key, now, out)) {
-                            ensure_lane_rr_entry_locked(lane_key);
-                            dst_tgid_owner_priority_frames++;
-                            if (dst_tgid_owner_priority_frames == 1U || (dst_tgid_owner_priority_frames % 500U) == 0U) {
-                                BOOST_LOG_TRIVIAL(warning) << "dvmtrp25stream: prioritizing dstTg owner queued frame"
-                                                           << ", dstTg = " << candidate_dst_tgid
-                                                           << ", ownerCallKey = " << owner_call_key
-                                                           << ", waitingCallKey = " << candidate_call_key
-                                                           << ", endOfCall = " << out.end_of_call
-                                                           << ", priorityFrames = " << dst_tgid_owner_priority_frames;
-                            }
-                            return true;
-                        }
-
                         dst_tgid_blocked_frames++;
                         const std::string block_key = make_dst_tgid_block_key(candidate_dst_tgid, owner_call_key, candidate_call_key);
                         uint64_t& blocked_for_pair = dst_tgid_blocked_call_counts[block_key];
