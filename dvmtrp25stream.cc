@@ -345,9 +345,9 @@ std::string make_tgid_call_key(const std::string& short_name, long source_tgid, 
  */
 std::string make_mux_lane_key(const std::string& route_key, const std::string &short_name, uint32_t dst_tgid)
 {
+    (void)route_key;
     std::ostringstream oss;
     oss << short_name << ":" << dst_tgid;
-    oss << ":" << route_key;
     return oss.str();
 }
 
