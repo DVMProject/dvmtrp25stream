@@ -964,9 +964,10 @@ public:
                 leading_header = state.header;
             }
 
+            // A partial LDU must not keep an old clock alive across a transmission pause.
             const bool restart_packetizer =
                 state.next_imbe_emit_at.time_since_epoch().count() == 0 ||
-                (state.imbeCount == 0U && state.buffered_imbe.empty() &&
+                (state.buffered_imbe.empty() &&
                     state.last_imbe_received_at.time_since_epoch().count() != 0 &&
                     now - state.last_imbe_received_at > std::chrono::milliseconds(P25_PACKETIZER_RESET_GAP_MS));
             if (restart_packetizer) {
